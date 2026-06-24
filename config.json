@@ -1,0 +1,130 @@
+{
+  "description": "Unified configuration for cgkit (CH_CG coarse-graining toolkit)",
+  "version": "1.0",
+
+  "paths": {
+    "base_dir":                 "/mnt/d/Workbench/CH_CG/01.aa",
+    "cg_data_base_dir":         "/mnt/d/Workbench/CH_CG/02.cg_dataset",
+    "deepmd_output_base_dir":   "/mnt/d/Workbench/CH_CG/03.cg_npy/training_data",
+    "aa_data_base_dir":         "/mnt/d/Workbench/CH_CG/01.aa",
+    "log_dir":                  "/mnt/d/Workbench/CH_CG/01.aa",
+    "analysis_output_base_dir": "/mnt/d/Workbench/CH_CG/0x.cgdata_analysis"
+  },
+
+  "simulations": [
+    {
+      "name": "1-npt",
+      "description": "NPT equilibration at constant temperatures",
+      "enabled": true,
+      "trajectory_dir": "1-npt/traj",
+      "file_pattern": "NPT.{temp}.*",
+      "data_subdir": "1-npt/{temp}/",
+      "temperatures": [200, 300, 400, 500, 600],
+      "output_subdir": "1-npt/{temp}/"
+    },
+    {
+      "name": "2-nvt",
+      "description": "NVT equilibration at constant temperatures",
+      "enabled": true,
+      "trajectory_dir": "2-nvt/traj",
+      "file_pattern": "NVT.{temp}.*",
+      "data_subdir": "2-nvt/{temp}/",
+      "temperatures": [200, 300, 400, 500, 600],
+      "output_subdir": "2-nvt/{temp}/"
+    },
+    {
+      "name": "3-upT",
+      "description": "Temperature ramping from 200K to 600K",
+      "enabled": true,
+      "trajectory_dir": "3-upT/traj",
+      "file_pattern": "upT.*",
+      "data_subdir": "3-upT/",
+      "temperatures": null,
+      "output_subdir": "3-upT/"
+    },
+    {
+      "name": "4-dnT",
+      "description": "Temperature cooling from 600K to 200K",
+      "enabled": true,
+      "trajectory_dir": "4-dnT/traj",
+      "file_pattern": "dnT.*",
+      "data_subdir": "4-dnT/",
+      "temperatures": null,
+      "output_subdir": "4-dnT/"
+    }
+  ],
+
+  "coarse_graining": {
+    "method": "flexible_pattern",
+    "patterns": [[1, 2, 2]],
+    "center_atom_type": 1,
+    "position_source": "unwrapped",
+    "force_energy_source": "average",
+    "average_forces": true,
+    "average_potential_energy": true,
+    "export_cg_trajectory": true,
+    "cg_trajectory_filename": "{basename}_cg.lammpstrj",
+    "cg_assignments": [
+      {"atom_ids": [1, 401, 402, 403], "cg_type": 2, "description": "4 atoms -> type 2"},
+      {"atom_ids": [400, 1200, 1201, 1202], "cg_type": 2, "description": "4 atoms -> type 2"}
+    ]
+  },
+
+  "deepmd": {
+    "num_groups": 1,
+    "use_type_column": true
+  },
+
+  "fparam": {
+    "unit": "eV",
+    "extract": {
+      "sim_names": ["3-upT", "4-dnT"]
+    },
+    "const": {
+      "sim_names": ["1-npt", "2-nvt"],
+      "temperatures": [200, 300, 400, 500, 600]
+    }
+  },
+
+  "analysis_cg": {
+    "sample": null,
+    "max_files": null,
+    "output_dir": "/mnt/d/Workbench/CH_CG/0x.cgdata_analysis/cg_analysis"
+  },
+
+  "analysis_atomic": {
+    "mode": "cg",
+    "max_frames": 500,
+    "max_per_file": 10,
+    "output_dir": "/mnt/d/Workbench/CH_CG/0x.cgdata_analysis/structure_analysis",
+    "gnn_graph_viz": 6,
+    "gnn_edge_cutoff": null,
+    "skip_gnn_viz": false,
+    "soap":      {"rcut": 5.0, "n_max": 8, "l_max": 6, "sigma": 0.5},
+    "pca":       {"n_components": 10},
+    "tsne":      {"n_components": 2, "perplexity": 30, "max_iter": 1000},
+    "clustering": {"method": "dbscan", "min_samples": 5, "n_clusters": 4}
+  },
+
+  "processing": {
+    "parallel": true,
+    "max_workers": null,
+    "create_output_dirs": true,
+    "trajectory_filter": {
+      "enabled": false,
+      "selection_method": "max_interval",
+      "per_temp": {
+        "default": {"max_trajectories": null}
+      }
+    }
+  },
+
+  "output": {
+    "save_particles": true,
+    "save_box_vectors": true,
+    "save_raw_files": true,
+    "save_npy_files": true,
+    "particles_filename": "{basename}_particles.csv",
+    "box_vectors_filename": "{basename}_box_vectors.csv"
+  }
+}
