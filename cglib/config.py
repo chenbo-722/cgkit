@@ -47,6 +47,11 @@ COMMAND_PATH_OVERRIDES: Dict[str, Dict[str, str]] = {
         "base_dir":   None,  # depends on --mode, handled in merge function
         "output_dir": "analysis_atomic.output_dir",
     },
+    "plot-pt": {
+        "base_dir":   "paths.aa_data_base_dir",
+        "output_dir": "plot_pt.output_dir",
+        "log_dir":    "paths.log_dir",
+    },
 }
 
 
@@ -123,16 +128,21 @@ def merge_config_with_args(config: Dict[str, Any],
     if workers is not None:
         config.setdefault("processing", {})["max_workers"] = workers
 
-    # --base-dir / --output-dir / --log-dir, mapped per command
+    # --base-dir / --output-dir / --log-dir, mapped per command.
+    # analyze-atomic's base_dir is registered as None in COMMAND_PATH_OVERRIDES
+    # because the target key depends on --mode; resolve it here BEFORE the
+    # None-skip check, otherwise the CLI override is silently dropped.
     overrides = COMMAND_PATH_OVERRIDES.get(command_key, {})
     for attr, dotted_key in overrides.items():
         value = getattr(args, attr, None)
-        if value is None or dotted_key is None:
+        if value is None:
             continue
         if command_key == "analyze-atomic" and attr == "base_dir":
             mode = getattr(args, "mode", "cg")
             dotted_key = ("paths.aa_data_base_dir" if mode == "aa"
                           else "paths.cg_data_base_dir")
+        if dotted_key is None:
+            continue
         _set_dotted(config, dotted_key, value)
 
     # fparam-specific: --unit

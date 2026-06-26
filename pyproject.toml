@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ch-cgkit"
+version = "2.0.0"
+description = "CH_CG coarse-graining toolkit for polyethylene MD simulations"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "CH_CG" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "tqdm",
+]
+
+# Optional dependency groups mirror MANUAL.md section 2.2. Install the group(s)
+# matching the subcommands you actually use, e.g.  pip install -e ".[atomic,soap]"
+[project.optional-dependencies]
+cg      = ["matplotlib", "scipy"]
+atomic  = ["matplotlib", "scipy", "scikit-learn"]
+soap    = ["ase", "dscribe"]
+gnn     = ["torch", "torch-geometric"]
+networkx = ["networkx"]
+all     = [
+    "matplotlib", "scipy", "scikit-learn",
+    "ase", "dscribe",
+    "torch", "torch-geometric",
+    "networkx",
+]
+
+# Creates a `cgkit` executable on PATH that calls cgkit.py:main()
+[project.scripts]
+cgkit = "cgkit:main"
+
+# Flat layout: cgkit.py is a top-level module, cglib/ is the only package.
+# legacy/ and the .git/ tree are deliberately NOT packaged.
+[tool.setuptools]
+py-modules = ["cgkit"]
+packages = ["cglib"]
+
+# config.json lives at the project root and is located at runtime via
+# cglib/config.py's __file__-relative resolution, so no package_data is needed.

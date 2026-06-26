@@ -66,16 +66,35 @@ def _import_heavy_deps() -> None:
     if _DEPS_IMPORTED:
         return
 
-    # matplotlib (required by every plot method)
+    # matplotlib (required by every plot method) — Nature journal style
     import matplotlib
     matplotlib.use('Agg')
+    import matplotlib.font_manager as _fm
     import matplotlib.pyplot as _plt
     import matplotlib.colors as _mcolors
     from matplotlib.colors import BoundaryNorm as _BoundaryNorm
-    _plt.style.use('seaborn-v0_8-whitegrid')
-    _plt.rcParams['font.size'] = 10
-    _plt.rcParams['figure.dpi'] = 100
-    _plt.rcParams['savefig.dpi'] = 300
+    # Global rcParams: Arial sans-serif, 183 mm double-column, thin lines,
+    # no top/right spine, white background, no grid.
+    _plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+        'font.size': 10,
+        'axes.linewidth': 0.8,
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'axes.grid': False,
+        'figure.figsize': (7.2, 4.5),   # 183 mm wide
+        'figure.dpi': 120,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+        'legend.frameon': False,
+    })
+    # Font detection: warn (once, non-fatal) if Arial/Helvetica missing so
+    # users know figures fall back to DejaVu Sans.
+    _available_fonts = {f.name for f in _fm.fontManager.ttflist}
+    if not ({'Arial', 'Helvetica'} & _available_fonts):
+        print("Note: Arial/Helvetica not installed; falling back to DejaVu Sans "
+              "for publication figures.")
     plt = _plt
     mcolors = _mcolors
     BoundaryNorm = _BoundaryNorm
@@ -134,6 +153,60 @@ def _import_heavy_deps() -> None:
     HAS_TORCH = False
 
     _DEPS_IMPORTED = True
+
+
+# =============================================================================
+# Nature-style palette & legend helpers
+# =============================================================================
+
+# 8-color categorical palette (ColorBrewer-style: dark-blue -> light-blue ->
+# light-red -> dark-red). Used for sim_type scatter coloring so it pairs
+# naturally with the RdBu_r continuous cmap on the same figures.
+_NATURE_PALETTE_8 = [
+    '#08306b',  # dark blue
+    '#2171b5',  # medium blue
+    '#6baed6',  # light blue
+    '#c6dbef',  # pale blue
+    '#fcbba1',  # pale red
+    '#fc9272',  # light red
+    '#ef3b2c',  # medium red
+    '#a50f15',  # dark red
+]
+
+
+def _categorical_palette(n: int) -> np.ndarray:
+    """Return ``n`` RGBA rows suitable for ``scatter(color=...)``.
+
+    For ``n <= 8`` returns the first ``n`` entries of :data:`_NATURE_PALETTE_8`
+    via :func:`matplotlib.colors.to_rgba`. For ``n > 8`` cycles through the
+    base 8 colors so the mapping stays stable across calls.
+    """
+    if n <= 0:
+        return np.zeros((0, 4))
+    base = [_NATURE_PALETTE_8[i % len(_NATURE_PALETTE_8)] for i in range(n)]
+    return np.array([mcolors.to_rgba(c) for c in base])
+
+
+def _apply_lego_legend(ax, sim_types: List[str], outside: bool = True) -> None:
+    """Draw a frameless categorical legend for sim_type scatter groups.
+
+    Builds one ``Line2D`` proxy per entry in ``sim_types`` (in order) and
+    places it outside the axes (``outside=True``) or in the upper-right
+    corner. Colors are taken from :func:`_categorical_palette` so the legend
+    matches the scatter regardless of how many groups are present.
+    """
+    from matplotlib.lines import Line2D
+    colors = _categorical_palette(len(sim_types))
+    handles = [
+        Line2D([0], [0], marker='o', linestyle='None',
+               markerfacecolor=colors[i], markeredgecolor='none',
+               markersize=5, label=str(sim_types[i]))
+        for i in range(len(sim_types))
+    ]
+    ax.legend(handles=handles, loc='upper left' if outside else 'upper right',
+              bbox_to_anchor=(1.02, 1) if outside else None,
+              frameon=False, handletextpad=0.4, labelspacing=0.5,
+              borderaxespad=0.0)
 
 
 # =============================================================================
@@ -375,19 +448,189 @@ class AtomicStructureAnalyzer:
     # File discovery
     # ------------------------------------------------------------------
     def find_trajectory_files(self) -> List[str]:
-        """Find all LAMMPS trajectory files (AA mode)."""
+        """Find LAMMPS trajectory dump files (AA mode).
+
+        Honors ``self.base_dir`` (set from ``paths.aa_data_base_dir`` or
+        ``--base-dir``) and enumerates candidates recursively so the user
+        can point at any nesting level:
+
+          - ``…/01.aa``                    (parent-level, all sims)
+          - ``…/01.aa/1-npt``              (sim-level, all temperatures)
+          - ``…/01.aa/1-npt/200``          (single temperature)
+          - ``…/01.aa/1-npt/traj``        (a traj/ folder directly)
+
+        This project has mixed layouts: some sims put dumps under
+        ``<sim>/traj/<file>`` while others put them under
+        ``<sim>/<temp>/<file>``. A name-based filter skips obvious
+        non-dumps; :meth:`load_trajectories` still calls
+        ``LammpsDumpReader.parse_file()`` for final content validation.
+        """
         paths = self.config.get('paths', {})
-        aa_dir = Path(paths.get('aa_data_base_dir', '/mnt/d/Workbench/CH_CG/01.aa'))
-        return sorted(glob.glob(str(aa_dir / "*/traj/*")))
+        default_aa = '/mnt/d/Workbench/CH_CG/01.aa'
+        root = (self.base_dir
+                or Path(paths.get('aa_data_base_dir', default_aa)))
+        root = Path(root)
+
+        # Reject by name; reader does final content-based validation.
+        _NON_DUMP_SUFFIXES = (
+            '.restart', '.data', '.lmp', '.pb', '.pth', '.model',
+            '.sbatch', '.sh', '.slurm', '.py', '.md', '.txt', '.log',
+            '.json', '.yaml', '.toml', '.csv', '.raw', '.npy', '.npz',
+            '.png', '.jpg', '.pdf',
+        )
+        _NON_DUMP_NAMES = {'log.lammps', 'in.equil', 'in.relax', 'in.nve',
+                           'README'}
+
+        def _is_candidate(p: Path) -> bool:
+            if not p.is_file():
+                return False
+            name = p.name
+            if name in _NON_DUMP_NAMES:
+                return False
+            if '.restart' in name:  # catches both .restart and .restart.<n>
+                return False
+            if name.endswith(_NON_DUMP_SUFFIXES):
+                return False
+            # Final content peek: every LAMMPS dump starts with this line.
+            # Cheap (single read) and definitively rejects SLURM outputs,
+            # job logs, etc. that slip through the name filter.
+            try:
+                with open(p, 'rb') as fh:
+                    return fh.read(16).startswith(b'ITEM: TIMESTEP')
+            except OSError:
+                return False
+
+        candidates = glob.glob(str(root / '**' / '*'), recursive=True)
+        return sorted(f for f in candidates if _is_candidate(Path(f)))
 
     def find_cg_trajectory_files(self) -> List[str]:
-        """Find all CG ``*_cg.lammpstrj`` files (CG mode)."""
+        """Find CG ``*_cg.lammpstrj`` files (CG mode).
+
+        Mirrors :meth:`find_trajectory_files`: honors ``self.base_dir`` and
+        uses a recursive glob so ``--base-dir`` can target any nesting level:
+
+          - ``…/02.cg_dataset``               (parent, all sims)
+          - ``…/02.cg_dataset/1-npt``         (sim, all temps)
+          - ``…/02.cg_dataset/1-npt/200``     (single temperature)
+          - ``…/02.cg_dataset/3-upT``         (sim without temp subdirs)
+
+        The ``*_cg.lammpstrj`` suffix is unambiguous, so no further name or
+        content filtering is needed.
+        """
         paths = self.config.get('paths', {})
-        cg_base_dir = (paths.get('cg_data_base_dir')
-                       or self.config.get('cg_data_base_dir')
-                       or '/mnt/d/Workbench/CH_CG/02.cg_dataset')
-        pattern = str(Path(cg_base_dir) / "*/*/*_cg.lammpstrj")
-        return sorted(glob.glob(pattern))
+        default_cg = '/mnt/d/Workbench/CH_CG/02.cg_dataset'
+        root = (self.base_dir
+                or paths.get('cg_data_base_dir')
+                or self.config.get('cg_data_base_dir')
+                or default_cg)
+        root = Path(root)
+        pattern = str(root / '**' / '*_cg.lammpstrj')
+        return sorted(glob.glob(pattern, recursive=True))
+
+    @staticmethod
+    def _parse_cg_filepath(filepath: str) -> Tuple[str, Optional[int]]:
+        """Extract ``(sim_type, temperature)`` from a CG trajectory path.
+
+        Handles the project's two layouts uniformly:
+
+          - ``…/<sim>/<temp>/<file>_cg.lammpstrj``  -> ``(sim, int(temp))``
+          - ``…/<sim>/<file>_cg.lammpstrj``          -> ``(sim, None)``
+
+        ``None`` signals "no single temperature for this trajectory"
+        (e.g. ``3-upT`` / ``4-dnT`` ramping runs where T varies per frame).
+        """
+        parts = Path(filepath).parts
+        # parts[-1] = filename; look at the parent(s) for sim/temp.
+        if len(parts) >= 3 and parts[-2].isdigit():
+            return parts[-3], int(parts[-2])
+        if len(parts) >= 2:
+            return parts[-2], None
+        return 'unknown', None
+
+    @staticmethod
+    def _extract_sim_type_and_temp(filepath: str) -> Tuple[str, Optional[int]]:
+        """Extract ``(sim_type, nominal_temp)`` from an AA dump path.
+
+        Robust to the project's three observed layouts:
+
+          1. ``…/<sim>/traj/<file>``        (sim_type=<sim>, temp=None)
+          2. ``…/<sim>/<temp>/<file>``      (sim_type=<sim>, temp=int)
+          3. ``…/<sim>/<PREFIX>.<T>.<step>`` (sim_type=<sim>, temp from filename)
+
+        Last resort: sim_type = parent dir basename, temp = None.
+        """
+        p = Path(filepath)
+        parts = p.parts
+        name = p.name
+        parent = p.parent.name
+
+        # Rule 1: a 'traj' segment anywhere in the path -> the parent of 'traj'
+        # is the sim dir (or, for ``<sim>/<temp>/traj/<file>`` layouts, the
+        # grandparent is the sim dir and the parent is the nominal T).
+        if 'traj' in parts:
+            try:
+                idx = parts.index('traj')
+                if idx >= 1:
+                    parent_of_traj = parts[idx - 1]
+                    if parent_of_traj.isdigit() and idx >= 2:
+                        return parts[idx - 2], int(parent_of_traj)
+                    return parent_of_traj, None
+            except ValueError:
+                pass
+
+        # Rule 2: parent dir is a pure integer -> that's the temp
+        if parent.isdigit():
+            sim_type = parts[-3] if len(parts) >= 3 else 'unknown'
+            return sim_type, int(parent)
+
+        # Rule 3: filename has shape '<PREFIX>.<temp>.<step>' with integer
+        # temp and step fields.
+        tokens = name.split('.')
+        if len(tokens) >= 3 and tokens[-2].isdigit():
+            try:
+                return parent, int(tokens[-2])
+            except ValueError:
+                pass
+
+        # Fallback
+        return parent, None
+
+    @staticmethod
+    def _build_structure_id(sim_type: str, temp: Optional[int],
+                            timestep: int) -> str:
+        """Build a human-readable composite ID ``{sim}/{temp_or_ramp}@{step}``.
+
+        ``temp=None`` (ramping runs) renders as the literal ``ramp``.
+        """
+        temp_str = str(temp) if temp is not None else 'ramp'
+        return f"{sim_type}/{temp_str}@{timestep}"
+
+    def _propagate_metadata(self) -> None:
+        """Ensure every loaded structure has the canonical metadata fields.
+
+        Guarantees ``sim_type``, ``temp`` (Optional[int]), ``timestep``,
+        ``source_file``, and ``structure_id`` exist on each entry of
+        ``self.structures`` (AA) and ``self.cg_structures`` (CG). Called once
+        at the end of each loader; idempotent.
+        """
+        for pool_name in ('structures', 'cg_structures'):
+            pool = getattr(self, pool_name, None)
+            if not pool:
+                continue
+            for s in pool:
+                # If either sim_type or temp is missing, re-derive both from
+                # source_file (they are coupled; partial extraction is wrong).
+                if ('sim_type' not in s or 'temp' not in s) and s.get('source_file'):
+                    sim, temp = self._extract_sim_type_and_temp(s['source_file'])
+                    s.setdefault('sim_type', sim)
+                    s.setdefault('temp', temp)
+                # Final fallbacks for missing keys
+                s.setdefault('sim_type', 'unknown')
+                s.setdefault('temp', None)
+                s.setdefault('timestep', 0)
+                if not s.get('structure_id'):
+                    s['structure_id'] = self._build_structure_id(
+                        s['sim_type'], s['temp'], s['timestep'])
 
     # ------------------------------------------------------------------
     # Trajectory loading
@@ -417,7 +660,13 @@ class AtomicStructureAnalyzer:
                 if frame is None:
                     continue
                 frame['source_file'] = filepath
-                frame['sim_type'] = filepath.split('/')[-3]
+                sim_type, temp = self._extract_sim_type_and_temp(filepath)
+                frame['sim_type'] = sim_type
+                frame['temp'] = temp
+                # Numeric temperature alias for legacy plotting code that reads
+                # 'temperature'; ramping runs fall back to 300 K (TODO: should
+                # pull measured T from log.lammps in a follow-up).
+                frame['temperature'] = temp if temp is not None else 300
                 structures.append(frame)
                 if len(structures) % 50 == 0:
                     print(f"  Loaded {len(structures)} frames...")
@@ -426,6 +675,7 @@ class AtomicStructureAnalyzer:
 
         print(f"Successfully loaded {len(structures)} frames")
         self.structures = structures
+        self._propagate_metadata()
         return structures
 
     def load_cg_trajectories(self, max_frames: Optional[int] = None,
@@ -439,8 +689,7 @@ class AtomicStructureAnalyzer:
                          if sim.get('enabled', True)}
         if allowed_names:
             files = [f for f in files
-                     if (Path(f).parts[-3] if len(Path(f).parts) >= 3 else 'unknown')
-                     in allowed_names]
+                     if self._parse_cg_filepath(f)[0] in allowed_names]
             print(f"Found {len(files)} CG trajectory files "
                   f"(filtered by allowed types: {sorted(allowed_names)})")
         else:
@@ -462,12 +711,11 @@ class AtomicStructureAnalyzer:
             if len(cg_data) >= max_frames:
                 break
 
-            parts = Path(filepath).parts
-            sim_type = parts[-3] if len(parts) >= 3 else 'unknown'
-            try:
-                temp = int(parts[-2])
-            except (ValueError, IndexError):
-                temp = 300
+            sim_type, parsed_temp = self._parse_cg_filepath(filepath)
+            # Canonical: Optional[int], None for ramping runs.
+            temp = parsed_temp
+            # Legacy numeric alias (TODO: real fix pulls measured T from log).
+            temperature_numeric = parsed_temp if parsed_temp is not None else 300
 
             # Optional energy lookup from sibling _particles.csv
             basename = Path(filepath).stem.replace('_cg', '')
@@ -495,7 +743,8 @@ class AtomicStructureAnalyzer:
                         break
                     frame['source_file'] = filepath
                     frame['sim_type'] = sim_type
-                    frame['temperature'] = temp
+                    frame['temp'] = temp
+                    frame['temperature'] = temperature_numeric
                     if total_energy is not None:
                         frame['total_energy'] = total_energy
                         frame['energies'] = np.array([total_energy])
@@ -506,6 +755,7 @@ class AtomicStructureAnalyzer:
 
         print(f"Successfully loaded {len(cg_data)} CG frames from {len(files)} files")
         self.cg_structures = cg_data
+        self._propagate_metadata()
         return cg_data
 
     # ------------------------------------------------------------------
@@ -624,6 +874,28 @@ class AtomicStructureAnalyzer:
             temperatures.append(struct.get('temperature', 300))
         return (np.array(energies), np.array(sim_types), np.array(temperatures))
 
+    @staticmethod
+    def _extract_id_columns(structures: List[Dict[str, Any]]
+                            ) -> Dict[str, List[Any]]:
+        """Build the canonical tracing columns for CSV writers.
+
+        Returns a dict with keys ``structure_id``, ``source_file``,
+        ``sim_type``, ``temp``, ``timestep`` — each a list aligned with
+        ``structures``. ``temp`` is ``None`` for ramping runs; callers that
+        want a numeric value should fall back to ``structure.get('temperature', 300)``.
+        """
+        cols: Dict[str, List[Any]] = {
+            'structure_id': [], 'source_file': [], 'sim_type': [],
+            'temp': [], 'timestep': [],
+        }
+        for s in structures:
+            cols['structure_id'].append(s.get('structure_id', ''))
+            cols['source_file'].append(s.get('source_file', ''))
+            cols['sim_type'].append(s.get('sim_type', 'unknown'))
+            cols['temp'].append(s.get('temp'))
+            cols['timestep'].append(s.get('timestep', 0))
+        return cols
+
     def _pca_variances(self) -> np.ndarray:
         if self._pca_object is not None:
             return self._pca_object.explained_variance_ratio_
@@ -663,20 +935,19 @@ class AtomicStructureAnalyzer:
             return 0
 
         # === Overall ===
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4))
 
         ax = axes[0]
         norm = plt.Normalize(vmin=energies.min(), vmax=energies.max())
         scatter = ax.scatter(pca_result[:, 0], pca_result[:, 1],
-                             c=energies, cmap='viridis', norm=norm, alpha=0.6, s=30)
+                             c=energies, cmap='RdBu_r', norm=norm, alpha=0.6, s=30)
         ax.set_xlabel('PC1 (%.1f%%)' % get_var(0))
         ax.set_ylabel('PC2 (%.1f%%)' % get_var(1))
         ax.set_title('Overall: PC1 vs PC2 (colored by energy)')
-        ax.grid(alpha=0.3)
         plt.colorbar(scatter, ax=ax, label='Energy')
 
         ax = axes[1]
-        colors_sim = plt.cm.Set3(np.linspace(0, 1, len(unique_sim_types)))
+        colors_sim = _categorical_palette(len(unique_sim_types))
         color_map = {t: colors_sim[i] for i, t in enumerate(unique_sim_types)}
         for sim_type in unique_sim_types:
             mask = sim_types == sim_type
@@ -685,8 +956,7 @@ class AtomicStructureAnalyzer:
         ax.set_xlabel('PC1 (%.1f%%)' % get_var(0))
         ax.set_ylabel('PC2 (%.1f%%)' % get_var(1))
         ax.set_title('Overall: PC1 vs PC2 (colored by sim type)')
-        ax.legend()
-        ax.grid(alpha=0.3)
+        _apply_lego_legend(ax, unique_sim_types, outside=len(unique_sim_types) > 6)
 
         plt.suptitle(f'PCA Analysis - Overall ({prefix}CG Data)' if use_cg_data
                      else 'PCA Analysis - Overall',
@@ -704,7 +974,7 @@ class AtomicStructureAnalyzer:
                 mask = sim_types == sim_type
                 if np.sum(mask) == 0:
                     continue
-                fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+                fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4))
                 pca_subset = pca_result[mask]
                 energies_subset = energies[mask]
                 temps_subset = temperatures[mask]
@@ -712,24 +982,22 @@ class AtomicStructureAnalyzer:
                 ax = axes[0]
                 norm = plt.Normalize(vmin=energies_subset.min(), vmax=energies_subset.max())
                 scatter = ax.scatter(pca_subset[:, 0], pca_subset[:, 1],
-                                     c=energies_subset, cmap='viridis', norm=norm,
+                                     c=energies_subset, cmap='RdBu_r', norm=norm,
                                      alpha=0.6, s=30)
                 ax.set_xlabel('PC1 (%.1f%%)' % get_var(0))
                 ax.set_ylabel('PC2 (%.1f%%)' % get_var(1))
                 ax.set_title(f'{sim_type}: PC1 vs PC2 (colored by energy)')
-                ax.grid(alpha=0.3)
                 plt.colorbar(scatter, ax=ax, label='Energy')
 
                 ax = axes[1]
                 bounds = np.linspace(min(unique_temps) - 25, max(unique_temps) + 25, 11)
                 temp_norm_disc = BoundaryNorm(bounds, ncolors=10)
                 scatter = ax.scatter(pca_subset[:, 0], pca_subset[:, 1],
-                                     c=temps_subset, cmap=plt.cm.RdBu,
+                                     c=temps_subset, cmap=plt.cm.RdBu_r,
                                      norm=temp_norm_disc, alpha=0.6, s=30)
                 ax.set_xlabel('PC1 (%.1f%%)' % get_var(0))
                 ax.set_ylabel('PC2 (%.1f%%)' % get_var(1))
                 ax.set_title(f'{sim_type}: PC1 vs PC2 (colored by temperature)')
-                ax.grid(alpha=0.3)
                 cbar = plt.colorbar(scatter, ax=ax, label='Temperature (K)')
                 if len(unique_temps) <= 10:
                     cbar.set_ticks(unique_temps)
@@ -763,20 +1031,19 @@ class AtomicStructureAnalyzer:
         unique_sim_types = sorted(list(set(sim_types)))
 
         # === Overall ===
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4))
 
         ax = axes[0]
         norm = plt.Normalize(vmin=energies.min(), vmax=energies.max())
         scatter = ax.scatter(tsne_result[:, 0], tsne_result[:, 1],
-                             c=energies, cmap='viridis', norm=norm, alpha=0.6, s=30)
+                             c=energies, cmap='RdBu_r', norm=norm, alpha=0.6, s=30)
         ax.set_xlabel('t-SNE Component 1')
         ax.set_ylabel('t-SNE Component 2')
         ax.set_title('Overall: t-SNE (colored by energy)')
-        ax.grid(alpha=0.3)
         plt.colorbar(scatter, ax=ax, label='Energy')
 
         ax = axes[1]
-        colors_sim = plt.cm.Set3(np.linspace(0, 1, len(unique_sim_types)))
+        colors_sim = _categorical_palette(len(unique_sim_types))
         color_map = {t: colors_sim[i] for i, t in enumerate(unique_sim_types)}
         for sim_type in unique_sim_types:
             mask = sim_types == sim_type
@@ -785,8 +1052,7 @@ class AtomicStructureAnalyzer:
         ax.set_xlabel('t-SNE Component 1')
         ax.set_ylabel('t-SNE Component 2')
         ax.set_title('Overall: t-SNE (colored by sim type)')
-        ax.legend()
-        ax.grid(alpha=0.3)
+        _apply_lego_legend(ax, unique_sim_types, outside=len(unique_sim_types) > 6)
 
         plt.suptitle(f't-SNE Analysis - Overall ({prefix}CG Data)' if use_cg_data
                      else 't-SNE Analysis - Overall',
@@ -804,7 +1070,7 @@ class AtomicStructureAnalyzer:
                 mask = sim_types == sim_type
                 if np.sum(mask) == 0:
                     continue
-                fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+                fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4))
                 tsne_subset = tsne_result[mask]
                 energies_subset = energies[mask]
                 temps_subset = temperatures[mask]
@@ -812,24 +1078,22 @@ class AtomicStructureAnalyzer:
                 ax = axes[0]
                 norm = plt.Normalize(vmin=energies_subset.min(), vmax=energies_subset.max())
                 scatter = ax.scatter(tsne_subset[:, 0], tsne_subset[:, 1],
-                                     c=energies_subset, cmap='viridis', norm=norm,
+                                     c=energies_subset, cmap='RdBu_r', norm=norm,
                                      alpha=0.6, s=30)
                 ax.set_xlabel('t-SNE Component 1')
                 ax.set_ylabel('t-SNE Component 2')
                 ax.set_title(f'{sim_type}: t-SNE (colored by energy)')
-                ax.grid(alpha=0.3)
                 plt.colorbar(scatter, ax=ax, label='Energy')
 
                 ax = axes[1]
                 bounds = np.linspace(min(unique_temps) - 25, max(unique_temps) + 25, 11)
                 temp_norm_disc = BoundaryNorm(bounds, ncolors=10)
                 scatter = ax.scatter(tsne_subset[:, 0], tsne_subset[:, 1],
-                                     c=temps_subset, cmap=plt.cm.RdBu,
+                                     c=temps_subset, cmap=plt.cm.RdBu_r,
                                      norm=temp_norm_disc, alpha=0.6, s=30)
                 ax.set_xlabel('t-SNE Component 1')
                 ax.set_ylabel('t-SNE Component 2')
                 ax.set_title(f'{sim_type}: t-SNE (colored by temperature)')
-                ax.grid(alpha=0.3)
                 cbar = plt.colorbar(scatter, ax=ax, label='Temperature (K)')
                 if len(unique_temps) <= 10:
                     cbar.set_ticks(unique_temps)
@@ -849,7 +1113,7 @@ class AtomicStructureAnalyzer:
             print("No GNN results available")
             return
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4))
 
         energies: List[float] = []
         sim_types: List[str] = []
@@ -864,16 +1128,15 @@ class AtomicStructureAnalyzer:
 
         ax = axes[0]
         scatter = ax.scatter(self.gnn_result[:, 0], self.gnn_result[:, 1],
-                             c=energies_arr, cmap='viridis', norm=norm, alpha=0.6, s=30)
+                             c=energies_arr, cmap='RdBu_r', norm=norm, alpha=0.6, s=30)
         ax.set_xlabel('GNN Dimension 1')
         ax.set_ylabel('GNN Dimension 2')
         ax.set_title('GNN Embedding: Colored by Energy')
-        ax.grid(alpha=0.3)
         plt.colorbar(scatter, ax=ax, label='Energy')
 
         ax = axes[1]
         unique_types = list(set(sim_types))
-        colors_type = plt.cm.Set3(np.linspace(0, 1, len(unique_types)))
+        colors_type = _categorical_palette(len(unique_types))
         color_map = {t: colors_type[i] for i, t in enumerate(unique_types)}
         for sim_type in unique_types:
             mask = np.array(sim_types) == sim_type
@@ -882,8 +1145,7 @@ class AtomicStructureAnalyzer:
         ax.set_xlabel('GNN Dimension 1')
         ax.set_ylabel('GNN Dimension 2')
         ax.set_title('GNN Embedding: Colored by Simulation Type')
-        ax.legend()
-        ax.grid(alpha=0.3)
+        _apply_lego_legend(ax, unique_types, outside=len(unique_types) > 6)
 
         plt.suptitle('GNN Analysis of Atomic Structures',
                      fontsize=14, fontweight='bold')
@@ -906,7 +1168,7 @@ class AtomicStructureAnalyzer:
 
         n_cols = 3
         n_rows = (num_examples + n_cols - 1) // n_cols
-        fig = plt.figure(figsize=(18, 6 * n_rows))
+        fig = plt.figure(figsize=(7.2, 2.4 * n_rows))
         gs = fig.add_gridspec(n_rows, n_cols, hspace=0.3, wspace=0.3)
 
         for plot_idx, struct_idx in enumerate(indices):
@@ -983,7 +1245,7 @@ class AtomicStructureAnalyzer:
             self.plot_gnn_network_topology(indices_list)
 
     def plot_gnn_network_topology(self, indices) -> None:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+        fig, axes = plt.subplots(2, 2, figsize=(7.2, 6.0))
         axes_flat = axes.flatten()
 
         for ax_idx, struct_idx in enumerate(indices):
@@ -1059,7 +1321,7 @@ class AtomicStructureAnalyzer:
         features_arr = np.vstack(all_features)
         types_arr = np.array(all_types)
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig, axes = plt.subplots(2, 2, figsize=(7.2, 6.0))
 
         ax = axes[0, 0]
         for atom_type in [1, 2]:
@@ -1072,11 +1334,10 @@ class AtomicStructureAnalyzer:
         ax.set_ylabel('Mean Feature Value')
         ax.set_title('Node Feature Profiles by Atom Type')
         ax.legend()
-        ax.grid(alpha=0.3)
 
         ax = axes[0, 1]
         n_show = min(50, features_arr.shape[0])
-        im = ax.imshow(features_arr[:n_show].T, aspect='auto', cmap='viridis')
+        im = ax.imshow(features_arr[:n_show].T, aspect='auto', cmap='RdBu_r')
         ax.set_xlabel('Node Index')
         ax.set_ylabel('Feature Index')
         ax.set_title('Node Feature Heatmap')
@@ -1088,7 +1349,6 @@ class AtomicStructureAnalyzer:
         ax.set_xlabel('Feature Index')
         ax.set_ylabel('Variance')
         ax.set_title('Feature Variance Across All Nodes')
-        ax.grid(alpha=0.3)
 
         ax = axes[1, 1]
         n_feat_sample = min(16, features_arr.shape[1])
@@ -1138,20 +1398,19 @@ class AtomicStructureAnalyzer:
                             bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
         # === Overall ===
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4))
 
         ax = axes[0]
         scatter = ax.scatter(pca_result[:, 0], pca_result[:, 1],
-                             c=energies, cmap='viridis', alpha=0.6, s=30)
+                             c=energies, cmap='RdBu_r', alpha=0.6, s=30)
         ax.set_xlabel('PC1')
         ax.set_ylabel('PC2')
         ax.set_title('Overall: Clusters (colored by energy)')
-        ax.grid(alpha=0.3)
         plt.colorbar(scatter, ax=ax, label='Energy')
         _draw_centroids(ax, labels, pca_result)
 
         ax = axes[1]
-        colors_sim = plt.cm.Set3(np.linspace(0, 1, len(unique_sim_types)))
+        colors_sim = _categorical_palette(len(unique_sim_types))
         color_map = {t: colors_sim[i] for i, t in enumerate(unique_sim_types)}
         for sim_type in unique_sim_types:
             mask = sim_types == sim_type
@@ -1160,8 +1419,7 @@ class AtomicStructureAnalyzer:
         ax.set_xlabel('PC1')
         ax.set_ylabel('PC2')
         ax.set_title('Overall: Clusters (colored by sim type)')
-        ax.legend()
-        ax.grid(alpha=0.3)
+        _apply_lego_legend(ax, unique_sim_types, outside=len(unique_sim_types) > 6)
         _draw_centroids(ax, labels, pca_result)
 
         plt.suptitle(f'Cluster Analysis - Overall ({prefix}CG Data)' if use_cg_data
@@ -1180,7 +1438,7 @@ class AtomicStructureAnalyzer:
                 mask = sim_types == sim_type
                 if np.sum(mask) == 0:
                     continue
-                fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+                fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4))
                 pca_subset = pca_result[mask]
                 energies_subset = energies[mask]
                 temps_subset = temperatures[mask]
@@ -1188,11 +1446,10 @@ class AtomicStructureAnalyzer:
 
                 ax = axes[0]
                 scatter = ax.scatter(pca_subset[:, 0], pca_subset[:, 1],
-                                     c=energies_subset, cmap='viridis', alpha=0.6, s=30)
+                                     c=energies_subset, cmap='RdBu_r', alpha=0.6, s=30)
                 ax.set_xlabel('PC1')
                 ax.set_ylabel('PC2')
                 ax.set_title(f'{sim_type}: Clusters (colored by energy)')
-                ax.grid(alpha=0.3)
                 plt.colorbar(scatter, ax=ax, label='Energy')
                 _draw_centroids(ax, labels_subset, pca_subset)
 
@@ -1200,12 +1457,11 @@ class AtomicStructureAnalyzer:
                 bounds = np.linspace(min(unique_temps) - 25, max(unique_temps) + 25, 11)
                 temp_norm_disc = BoundaryNorm(bounds, ncolors=10)
                 scatter = ax.scatter(pca_subset[:, 0], pca_subset[:, 1],
-                                     c=temps_subset, cmap=plt.cm.RdBu,
+                                     c=temps_subset, cmap=plt.cm.RdBu_r,
                                      norm=temp_norm_disc, alpha=0.6, s=30)
                 ax.set_xlabel('PC1')
                 ax.set_ylabel('PC2')
                 ax.set_title(f'{sim_type}: Clusters (colored by temperature)')
-                ax.grid(alpha=0.3)
                 cbar = plt.colorbar(scatter, ax=ax, label='Temperature (K)')
                 if len(unique_temps) <= 10:
                     cbar.set_ticks(unique_temps)
@@ -1251,7 +1507,7 @@ class AtomicStructureAnalyzer:
 
         aa_cfg = self.config.get('analysis_atomic', {})
         plots_cfg = self.config.get('plots', {})
-        default_cmap = plots_cfg.get('colormap', 'RdBu')
+        default_cmap = plots_cfg.get('colormap', 'RdBu_r')
         color_levels = plots_cfg.get('color_levels',
                                      aa_cfg.get('color_levels', 10))
 
@@ -1261,7 +1517,7 @@ class AtomicStructureAnalyzer:
             return 0
 
         # === Overall (3x2) ===
-        fig, axes = plt.subplots(3, 2, figsize=(14, 18))
+        fig, axes = plt.subplots(3, 2, figsize=(7.2, 9.0))
 
         # Row 1: PCA
         ax = axes[0, 0]
@@ -1271,11 +1527,10 @@ class AtomicStructureAnalyzer:
         ax.set_xlabel('PC1 (%.1f%%)' % get_var(0))
         ax.set_ylabel('PC2 (%.1f%%)' % get_var(1))
         ax.set_title('PCA: Overall (colored by energy)')
-        ax.grid(alpha=0.3)
         plt.colorbar(scatter, ax=ax, label='Energy')
 
         ax = axes[0, 1]
-        colors_sim = plt.cm.Set3(np.linspace(0, 1, len(unique_sim_types)))
+        colors_sim = _categorical_palette(len(unique_sim_types))
         color_map = {t: colors_sim[i] for i, t in enumerate(unique_sim_types)}
         for sim_type in unique_sim_types:
             mask = sim_types == sim_type
@@ -1285,7 +1540,6 @@ class AtomicStructureAnalyzer:
         ax.set_ylabel('PC2 (%.1f%%)' % get_var(1))
         ax.set_title('PCA: Overall (colored by sim type)')
         ax.legend(fontsize=8)
-        ax.grid(alpha=0.3)
 
         # Row 2: t-SNE
         if tsne_result is not None:
@@ -1296,7 +1550,6 @@ class AtomicStructureAnalyzer:
             ax.set_xlabel('t-SNE Component 1')
             ax.set_ylabel('t-SNE Component 2')
             ax.set_title('t-SNE: Overall (colored by energy)')
-            ax.grid(alpha=0.3)
             plt.colorbar(scatter, ax=ax, label='Energy')
 
             ax = axes[1, 1]
@@ -1308,7 +1561,6 @@ class AtomicStructureAnalyzer:
             ax.set_ylabel('t-SNE Component 2')
             ax.set_title('t-SNE: Overall (colored by sim type)')
             ax.legend(fontsize=8)
-            ax.grid(alpha=0.3)
         else:
             axes[1, 0].text(0.5, 0.5, 't-SNE not available', ha='center', va='center')
             axes[1, 0].axis('off')
@@ -1323,7 +1575,6 @@ class AtomicStructureAnalyzer:
             ax.set_xlabel('PC1')
             ax.set_ylabel('PC2')
             ax.set_title('Clustering: Overall (colored by energy)')
-            ax.grid(alpha=0.3)
             plt.colorbar(scatter, ax=ax, label='Energy')
             for label in sorted(set(labels)):
                 mask = labels == label
@@ -1343,7 +1594,6 @@ class AtomicStructureAnalyzer:
             ax.set_ylabel('PC2')
             ax.set_title('Clustering: Overall (colored by sim type)')
             ax.legend(fontsize=8)
-            ax.grid(alpha=0.3)
             for label in sorted(set(labels)):
                 mask = labels == label
                 if np.sum(mask) > 0:
@@ -1375,7 +1625,7 @@ class AtomicStructureAnalyzer:
                 if np.sum(mask) == 0:
                     continue
 
-                fig, axes = plt.subplots(3, 2, figsize=(14, 18))
+                fig, axes = plt.subplots(3, 2, figsize=(7.2, 9.0))
                 pca_subset = pca_result[mask]
                 energies_subset = energies[mask]
                 temps_subset = temperatures[mask]
@@ -1395,7 +1645,6 @@ class AtomicStructureAnalyzer:
                 ax.set_xlabel('PC1 (%.1f%%)' % get_var(0))
                 ax.set_ylabel('PC2 (%.1f%%)' % get_var(1))
                 ax.set_title(f'PCA: {sim_type} (colored by energy)')
-                ax.grid(alpha=0.3)
                 plt.colorbar(scatter, ax=ax, label='Energy')
 
                 ax = axes[0, 1]
@@ -1405,7 +1654,6 @@ class AtomicStructureAnalyzer:
                 ax.set_xlabel('PC1 (%.1f%%)' % get_var(0))
                 ax.set_ylabel('PC2 (%.1f%%)' % get_var(1))
                 ax.set_title(f'PCA: {sim_type} (colored by temperature)')
-                ax.grid(alpha=0.3)
                 cbar = plt.colorbar(scatter, ax=ax, label='Temperature (K)')
                 if len(unique_temps) <= color_levels:
                     cbar.set_ticks(unique_temps)
@@ -1420,7 +1668,6 @@ class AtomicStructureAnalyzer:
                     ax.set_xlabel('t-SNE Component 1')
                     ax.set_ylabel('t-SNE Component 2')
                     ax.set_title(f't-SNE: {sim_type} (colored by energy)')
-                    ax.grid(alpha=0.3)
                     plt.colorbar(scatter, ax=ax, label='Energy')
 
                     ax = axes[1, 1]
@@ -1430,7 +1677,6 @@ class AtomicStructureAnalyzer:
                     ax.set_xlabel('t-SNE Component 1')
                     ax.set_ylabel('t-SNE Component 2')
                     ax.set_title(f't-SNE: {sim_type} (colored by temperature)')
-                    ax.grid(alpha=0.3)
                     cbar = plt.colorbar(scatter, ax=ax, label='Temperature (K)')
                     if len(unique_temps) <= color_levels:
                         cbar.set_ticks(unique_temps)
@@ -1447,7 +1693,6 @@ class AtomicStructureAnalyzer:
                     ax.set_xlabel('PC1')
                     ax.set_ylabel('PC2')
                     ax.set_title(f'Clustering: {sim_type} (colored by energy)')
-                    ax.grid(alpha=0.3)
                     plt.colorbar(scatter, ax=ax, label='Energy')
                     for label in sorted(set(labels_subset)):
                         mask_l = labels_subset == label
@@ -1465,7 +1710,6 @@ class AtomicStructureAnalyzer:
                     ax.set_xlabel('PC1')
                     ax.set_ylabel('PC2')
                     ax.set_title(f'Clustering: {sim_type} (colored by temperature)')
-                    ax.grid(alpha=0.3)
                     cbar = plt.colorbar(scatter, ax=ax, label='Temperature (K)')
                     if len(unique_temps) <= color_levels:
                         cbar.set_ticks(unique_temps)
@@ -1532,6 +1776,8 @@ class AtomicStructureAnalyzer:
                 'tsne1': self.tsne_result[idx, 0] if self.tsne_result is not None else None,
                 'tsne2': self.tsne_result[idx, 1] if self.tsne_result is not None else None,
                 'cluster': self.labels[idx] if self.labels is not None else None,
+                'structure_id': struct.get('structure_id', ''),
+                'temp': struct.get('temp'),
             })
         outlier_df = pd.DataFrame(rows)
         outlier_df.to_csv(self.output_dir / 'outlier_structures.csv', index=False)
@@ -1557,12 +1803,17 @@ class AtomicStructureAnalyzer:
                     'fz': struct['forces'][i, 2] if struct['forces'] is not None else None,
                     'timestep': struct['timestep'],
                     'sim_type': struct.get('sim_type', 'unknown'),
+                    'structure_id': struct.get('structure_id', ''),
+                    'source_file': struct.get('source_file', ''),
+                    'temp': struct.get('temp'),
                 })
         df = pd.DataFrame(rows)
         df.to_csv(self.output_dir / filename, index=False)
         print(f"Saved: {self.output_dir / filename}")
 
     def save_all_analysis_results(self) -> None:
+        id_cols = self._extract_id_columns(self.structures)
+
         if self.pca_result is not None:
             pca_df = pd.DataFrame(self.pca_result[:, :10],
                                   columns=[f'PC{i+1}' for i in range(10)])
@@ -1570,6 +1821,9 @@ class AtomicStructureAnalyzer:
             pca_df['sim_type'] = [s.get('sim_type', 'unknown') for s in self.structures]
             if self.structures[0]['energies'] is not None:
                 pca_df['mean_energy'] = [s['energies'].mean() for s in self.structures]
+            pca_df['structure_id'] = id_cols['structure_id']
+            pca_df['source_file'] = id_cols['source_file']
+            pca_df['temp'] = id_cols['temp']
             pca_df.to_csv(self.output_dir / 'pca_results.csv', index=False)
             print(f"Saved: {self.output_dir / 'pca_results.csv'}")
 
@@ -1579,6 +1833,9 @@ class AtomicStructureAnalyzer:
             tsne_df['sim_type'] = [s.get('sim_type', 'unknown') for s in self.structures]
             if self.structures[0]['energies'] is not None:
                 tsne_df['mean_energy'] = [s['energies'].mean() for s in self.structures]
+            tsne_df['structure_id'] = id_cols['structure_id']
+            tsne_df['source_file'] = id_cols['source_file']
+            tsne_df['temp'] = id_cols['temp']
             tsne_df.to_csv(self.output_dir / 'tsne_results.csv', index=False)
             print(f"Saved: {self.output_dir / 'tsne_results.csv'}")
 
@@ -1589,6 +1846,9 @@ class AtomicStructureAnalyzer:
             gnn_df['sim_type'] = [s.get('sim_type', 'unknown') for s in self.structures]
             if self.structures[0]['energies'] is not None:
                 gnn_df['mean_energy'] = [s['energies'].mean() for s in self.structures]
+            gnn_df['structure_id'] = id_cols['structure_id']
+            gnn_df['source_file'] = id_cols['source_file']
+            gnn_df['temp'] = id_cols['temp']
             gnn_df.to_csv(self.output_dir / 'gnn_results.csv', index=False)
             print(f"Saved: {self.output_dir / 'gnn_results.csv'}")
 
@@ -1596,12 +1856,17 @@ class AtomicStructureAnalyzer:
             desc_df = pd.DataFrame(self.descriptors)
             desc_df['timestep'] = [s['timestep'] for s in self.structures]
             desc_df['sim_type'] = [s.get('sim_type', 'unknown') for s in self.structures]
+            desc_df['structure_id'] = id_cols['structure_id']
+            desc_df['source_file'] = id_cols['source_file']
+            desc_df['temp'] = id_cols['temp']
             desc_df.to_csv(self.output_dir / 'descriptors.csv', index=False)
             print(f"Saved: {self.output_dir / 'descriptors.csv'}")
 
     def save_cg_results(self) -> None:
         if not getattr(self, 'cg_structures', None):
             return
+
+        id_cols = self._extract_id_columns(self.cg_structures)
 
         if getattr(self, 'cg_pca_result', None) is not None:
             pca_df = pd.DataFrame(self.cg_pca_result[:, :10],
@@ -1613,6 +1878,9 @@ class AtomicStructureAnalyzer:
             elif self.cg_structures[0]['energies'] is not None:
                 pca_df['total_energy'] = [s['energies'].sum() if s['energies'] is not None else 0
                                           for s in self.cg_structures]
+            pca_df['structure_id'] = id_cols['structure_id']
+            pca_df['source_file'] = id_cols['source_file']
+            pca_df['temp'] = id_cols['temp']
             pca_df.to_csv(self.output_dir / 'CG_pca_results.csv', index=False)
             print(f"Saved: {self.output_dir / 'CG_pca_results.csv'}")
 
@@ -1625,6 +1893,9 @@ class AtomicStructureAnalyzer:
             elif self.cg_structures[0]['energies'] is not None:
                 tsne_df['total_energy'] = [s['energies'].sum() if s['energies'] is not None else 0
                                            for s in self.cg_structures]
+            tsne_df['structure_id'] = id_cols['structure_id']
+            tsne_df['source_file'] = id_cols['source_file']
+            tsne_df['temp'] = id_cols['temp']
             tsne_df.to_csv(self.output_dir / 'CG_tsne_results.csv', index=False)
             print(f"Saved: {self.output_dir / 'CG_tsne_results.csv'}")
 
@@ -1632,6 +1903,9 @@ class AtomicStructureAnalyzer:
             desc_df = pd.DataFrame(self.cg_descriptors)
             desc_df['sim_type'] = [s.get('sim_type', 'unknown') for s in self.cg_structures]
             desc_df['temperature'] = [s.get('temperature', 300) for s in self.cg_structures]
+            desc_df['structure_id'] = id_cols['structure_id']
+            desc_df['source_file'] = id_cols['source_file']
+            desc_df['temp'] = id_cols['temp']
             desc_df.to_csv(self.output_dir / 'CG_descriptors.csv', index=False)
             print(f"Saved: {self.output_dir / 'CG_descriptors.csv'}")
 

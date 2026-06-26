@@ -1,6 +1,6 @@
 # cgkit — CH_CG Coarse-Graining Toolkit
 
-`cgkit` is the single entry point for the **CH_CG PYTHON_tools** suite: a set of
+`cgkit` is the single entry point for the **CH_CG cgkit** suite: a set of
 Python utilities that take atomic-level LAMMPS trajectories of polyethylene (PE)
 and produce coarse-grained (CG) training data for DeepMD-kit, plus statistical
 and structural analyses of those CG datasets.
@@ -13,7 +13,7 @@ domain algorithms 1:1. The originals are archived under `legacy/` for reference.
 
 | Surface      | Path                  | Purpose                                   |
 |--------------|-----------------------|-------------------------------------------|
-| Executable   | `cgkit.py`            | argparse dispatcher (≈ 80 lines)          |
+| Executable   | `cgkit` (entry point) | argparse dispatcher (≈ 80 lines)          |
 | Library      | `cglib/`              | 11 importable modules                     |
 | Config       | `config.json`         | unified config (8 top-level sections)     |
 | Reference    | `legacy/`             | the five original scripts, frozen         |
@@ -22,7 +22,43 @@ domain algorithms 1:1. The originals are archived under `legacy/` for reference.
 
 ## 1. Installation
 
-### Required (all subcommands)
+### Install the `cgkit` command (recommended)
+
+From the `cgkit/` project directory:
+
+```bash
+pip install -e .
+```
+
+This creates a `cgkit` executable on your `PATH` (in the conda/venv `bin/`).
+You can then run any subcommand from **any directory**:
+
+```bash
+cgkit cg-gen
+cgkit plot-pt --max-frames 200
+```
+
+`config.json` is auto-located relative to the source tree, so it is found
+regardless of your current directory. The install is **editable** — edits to
+`cgkit.py` / `cglib/` take effect immediately, no reinstall needed.
+
+Install optional dependency groups for the subcommands you use:
+
+```bash
+pip install -e ".[atomic,soap]"     # analyze-atomic with SOAP descriptors
+pip install -e ".[all]"             # everything (heavy: pulls torch, dscribe, …)
+```
+
+### Manual alternative (no install)
+
+You can also run `cgkit.py` directly without installing — but only from the
+project directory, since `cglib` must be importable:
+
+```bash
+cd cgkit && python cgkit.py cg-gen
+```
+
+### Required packages (all subcommands)
 
 ```bash
 pip install numpy pandas tqdm
@@ -50,31 +86,29 @@ subcommand will succeed with just `numpy/pandas/tqdm` installed. The
 ## 2. Quick start
 
 ```bash
-cd PYTHON_tools
-
 # 1. Build CG CSVs from atomic LAMMPS dumps
-python cgkit.py cg-gen
+cgkit cg-gen
 
 # 2. Convert CG CSVs to DeepMD-kit .raw / .npy
-python cgkit.py to-deepmd
+cgkit to-deepmd
 
 # 3. Generate fparam (per-frame T(t) from log.lammps)
-python cgkit.py fparam extract
-python cgkit.py fparam const                # constant-T frames for 1-npt/2-nvt
+cgkit fparam extract
+cgkit fparam const                # constant-T frames for 1-npt/2-nvt
 
 # 4. Statistical analysis of the CG dataset
-python cgkit.py analyze-cg
+cgkit analyze-cg
 
 # 5. SOAP / PCA / t-SNE / clustering of CG trajectories
-python cgkit.py analyze-atomic --mode cg
+cgkit analyze-atomic --mode cg
 ```
 
 Override anything on the CLI:
 
 ```bash
-python cgkit.py cg-gen --sim 1-npt --temp 200 300 --workers 4
-python cgkit.py fparam const --unit K       # Kelvin instead of eV
-python cgkit.py analyze-atomic --mode aa --max-frames 200
+cgkit cg-gen --sim 1-npt --temp 200 300 --workers 4
+cgkit fparam const --unit K       # Kelvin instead of eV
+cgkit analyze-atomic --mode aa --max-frames 200
 ```
 
 ---
@@ -203,7 +237,39 @@ either CG trajectories (`--mode cg`, reads `*_cg.lammpstrj`) or atomic dumps
 ```
 
 **Outputs:** `pca_results.csv`, `tsne_results.csv`, `descriptors.csv`,
-`outlier_structures.csv`, plus PNG figures under `figures/`.
+`outlier_structures.csv`, plus PNG figures under `figures/`. Since v2 all
+CSVs end with the tracing columns `structure_id, source_file, temp` so any
+point in PCA/t-SNE/cluster space can be mapped back to its original dump
+frame (`structure_id` format: `<sim>/<temp|ramp>@<timestep>`).
+
+---
+
+### `cgkit plot-pt`  *(new module)*
+
+Joins every AA dump frame to its thermo row in `<sim>/log.lammps` and renders
+a single P-vs-T scatter, colored by `sim_type`. Useful for spotting holes in
+the (P, T) coverage of the training set before fitting a CG potential. Uses
+`cglib.fparam.parse_lammps_thermo` + `query_thermo` to resolve `Temp`/`Press`
+per timestep across multi-block logs (handles `reset_timestep` between
+temperature sweeps).
+
+**Config sections read:** `plot_pt.*` (`output_dir`, `max_frames`),
+`paths.{aa_data_base_dir,log_dir}`, `analysis_atomic.max_frames` (fallback).
+
+**CLI:**
+```
+--base-dir DIR       override paths.aa_data_base_dir (AA dump root)
+--output-dir DIR     override plot_pt.output_dir (CSV + PNG destination)
+--log-dir DIR        override paths.log_dir (root holding <sim>/log.lammps)
+--max-frames N       cap total frames plotted (uniform downsample)
+--sim/--temp         filter by sim_type / path-derived nominal T
+```
+
+**Outputs** (under `<output_dir>/pt_overview/`):
+- `pt_data.csv` — one row per frame with columns
+  `structure_id, sim_type, temp_nominal, temp_measured, pressure, timestep, source_file`
+- `figures/pt_overview.png` — Nature-style scatter (Arial, 183 mm wide,
+  red-blue categorical palette, frameless legend)
 
 ---
 
@@ -236,11 +302,11 @@ The unified config has 8 top-level sections (plus `description`/`version`):
 
 `cgkit` writes CLI overrides into the *right* config key per subcommand:
 
-| CLI flag             | cg-gen                   | to-deepmd                   | fparam extract              | fparam const                 | analyze-cg                 | analyze-atomic                |
-|----------------------|--------------------------|-----------------------------|-----------------------------|------------------------------|----------------------------|-------------------------------|
-| `--base-dir DIR`     | `paths.base_dir`         | `paths.cg_data_base_dir`    | _(n/a)_                     | `paths.deepmd_output_base_dir` | `paths.cg_data_base_dir`  | `paths.{cg,aa}_data_base_dir` |
-| `--output-dir DIR`   | `paths.cg_data_base_dir` | `paths.deepmd_output_base_dir` | `paths.deepmd_output_base_dir` | _(n/a)_                  | `analysis_cg.output_dir`   | `analysis_atomic.output_dir`  |
-| `--log-dir DIR`      | _(n/a)_                  | _(n/a)_                     | `paths.log_dir`             | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       |
+| CLI flag             | cg-gen                   | to-deepmd                   | fparam extract              | fparam const                 | analyze-cg                 | analyze-atomic                | plot-pt                       |
+|----------------------|--------------------------|-----------------------------|-----------------------------|------------------------------|----------------------------|-------------------------------|-------------------------------|
+| `--base-dir DIR`     | `paths.base_dir`         | `paths.cg_data_base_dir`    | _(n/a)_                     | `paths.deepmd_output_base_dir` | `paths.cg_data_base_dir`  | `paths.{cg,aa}_data_base_dir` | `paths.aa_data_base_dir`      |
+| `--output-dir DIR`   | `paths.cg_data_base_dir` | `paths.deepmd_output_base_dir` | `paths.deepmd_output_base_dir` | _(n/a)_                  | `analysis_cg.output_dir`   | `analysis_atomic.output_dir`  | `plot_pt.output_dir`          |
+| `--log-dir DIR`      | _(n/a)_                  | _(n/a)_                     | `paths.log_dir`             | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | `paths.log_dir`               |
 
 Mapping lives in `cglib/config.py::COMMAND_PATH_OVERRIDES`.
 
@@ -299,7 +365,7 @@ results = run_parallel(
 ## 6. Workflow example (end-to-end PE CG)
 
 ```bash
-cd PYTHON_tools
+cd cgkit
 
 # Step 1: atomic LAMMPS dumps -> CG CSVs (one _particles.csv + _box_vectors.csv per dump)
 python cgkit.py cg-gen --workers 8
@@ -372,7 +438,7 @@ You ran `analyze-cg` or `analyze-atomic` without the optional extras. See
 
 **`Config file not found: ...config.json`**
 Pass `--config /path/to/config.json` explicitly, or run from a directory whose
-`PYTHON_tools/config.json` exists.
+`cgkit/config.json` exists.
 
 **`[skip] Log not found` in `fparam extract`**
 The `paths.log_dir` / `--log-dir` directory does not contain

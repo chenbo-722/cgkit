@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cgkit - single-entry dispatcher for the CH_CG PYTHON_tools suite.
+"""cgkit - single-entry dispatcher for the CH_CG cgkit suite.
 
 Subcommands (each maps 1:1 to a former standalone script):
 
@@ -9,6 +9,7 @@ Subcommands (each maps 1:1 to a former standalone script):
     cgkit fparam const    # legacy generate_fparam.py const
     cgkit analyze-cg      # legacy 0x-analyze_cg_data.py
     cgkit analyze-atomic  # legacy 0x-analyze_atomic_structure.py
+    cgkit plot-pt         # new: P/T coverage scatter from log.lammps
 
 Design: top-level imports are limited to numpy/pandas-grade modules so that
 ``cgkit --help`` and all non-analysis subcommands work without matplotlib /
@@ -23,7 +24,7 @@ from typing import Optional
 # Top-level: CLI + domain modules that need only numpy/pandas/tqdm.
 from cglib.cli import build_parser
 from cglib.config import load_config, merge_config_with_args, default_config_path
-from cglib import cg_gen, deepmd_conv, fparam, analyze_cg
+from cglib import cg_gen, deepmd_conv, fparam, analyze_cg, pt_plot
 
 
 # =============================================================================
@@ -47,6 +48,7 @@ DISPATCH = {
     "fparam":          (fparam.run,           True),
     "analyze-cg":      (analyze_cg.run,       False),
     "analyze-atomic":  (_run_analyze_atomic,  False),
+    "plot-pt":         (pt_plot.run,          False),
 }
 
 

@@ -15,7 +15,7 @@ from typing import Iterable
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add args shared by every cgkit subcommand."""
     parser.add_argument('--config', '-c', type=str, default=None,
-                        help='Path to config.json (default: PYTHON_tools/config.json)')
+                        help='Path to config.json (default: cgkit/config.json)')
     parser.add_argument('--sim', type=str, nargs='+', default=None, metavar='NAME',
                         help='Process only the named simulation(s), e.g. '
                              '--sim 1-npt or --sim 3-upT 4-dnT.')
@@ -41,6 +41,7 @@ Examples:
   cgkit fparam const --unit K               # constant-T fparam in Kelvin
   cgkit analyze-cg                          # statistical CG analysis
   cgkit analyze-atomic --mode cg            # SOAP/PCA/t-SNE on CG trajectories
+  cgkit plot-pt                             # P-T coverage scatter from log.lammps
 """,
     )
     sub = parser.add_subparsers(dest='command', required=True, metavar='<command>')
@@ -132,6 +133,25 @@ Examples:
                         help='Cap on total frames analysed.')
     p_anat.add_argument('--max-per-file', type=int, default=None, metavar='N',
                         help='Cap on frames per trajectory file (CG mode only).')
+
+    # --- plot-pt -----------------------------------------------------------
+    p_pt = sub.add_parser(
+        'plot-pt',
+        help='P/T overview from log.lammps (new module)',
+        description='Join every AA dump frame to its thermo row in '
+                    'log.lammps and render a single P-vs-T scatter. Useful '
+                    'for spotting holes in the (P, T) coverage of the '
+                    'training set before fitting a CG potential.',
+    )
+    add_common_args(p_pt)
+    p_pt.add_argument('--base-dir', type=str, default=None,
+                      help='Override paths.aa_data_base_dir (AA dump root).')
+    p_pt.add_argument('--output-dir', type=str, default=None,
+                      help='Override plot_pt.output_dir (CSV + PNG destination).')
+    p_pt.add_argument('--log-dir', type=str, default=None,
+                      help='Override paths.log_dir (root holding <sim>/log.lammps).')
+    p_pt.add_argument('--max-frames', type=int, default=None, metavar='N',
+                      help='Cap on total frames plotted (uniform downsample).')
 
     return parser
 

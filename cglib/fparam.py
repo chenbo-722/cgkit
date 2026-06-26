@@ -21,30 +21,107 @@ K_B_EV_PER_K = 8.617333262e-5
 # LAMMPS log parser (used by extract mode)
 # =============================================================================
 
-def parse_lammps_log(log_file: str) -> List[float]:
-    """Parse LAMMPS log.lammps and return per-step temperatures (Kelvin)."""
-    temps: List[float] = []
+def parse_lammps_thermo(log_file: str) -> List[Dict[int, Dict[str, float]]]:
+    """Parse LAMMPS ``log.lammps`` into a list of per-run-block thermo tables.
+
+    Each ``run`` block produces its own thermo table; timesteps may repeat
+    across blocks when ``reset_timestep`` is issued between runs (common in
+    multi-temperature NPT sweeps like ``01.aa/1-npt``). Returns a list of
+    dicts (one per block, in file order); each dict maps
+    ``step -> {col_name: value}``. Columns captured by LAMMPS header name:
+    ``Step, Temp, Press, E_pair, Lx, Ly, Lz``. Returns ``[]`` if no thermo
+    block is found.
+    """
+    blocks: List[Dict[int, Dict[str, float]]] = []
+    current: Dict[int, Dict[str, float]] = {}
+    col_idx: Dict[str, int] = {}
     in_thermo = False
-    temp_idx: Optional[int] = None
+
+    recognized = ('Step', 'Temp', 'Press', 'E_pair', 'Lx', 'Ly', 'Lz')
+
+    def _flush() -> None:
+        nonlocal current
+        if current:
+            blocks.append(current)
+            current = {}
 
     with open(log_file, 'r') as f:
         for line in f:
             line = line.strip()
-            if not in_thermo and 'Step' in line and 'Temp' in line:
-                headers = line.split()
-                if 'Temp' in headers:
-                    temp_idx = headers.index('Temp')
-                    in_thermo = True
-                    continue
-            if in_thermo:
-                parts = line.split()
-                if parts and parts[0].lstrip('-').isdigit():
-                    try:
-                        temps.append(float(parts[temp_idx]))
-                    except (ValueError, IndexError):
-                        pass
-                elif line.startswith('Loop time') or not parts:
-                    in_thermo = False
+            if not in_thermo:
+                if line.startswith('Step') and any(c in line for c in recognized[1:]):
+                    headers = line.split()
+                    col_idx = {h: i for i, h in enumerate(headers) if h in recognized}
+                    if 'Step' in col_idx:
+                        in_thermo = True
+                continue
+            parts = line.split()
+            if parts and parts[0].lstrip('-').isdigit():
+                try:
+                    step = int(parts[col_idx['Step']])
+                    row: Dict[str, float] = {}
+                    for col, idx in col_idx.items():
+                        if col == 'Step':
+                            continue
+                        try:
+                            row[col] = float(parts[idx])
+                        except (ValueError, IndexError):
+                            pass
+                    current[step] = row
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith('Loop time') or not parts:
+                _flush()
+                in_thermo = False
+                col_idx = {}
+    _flush()  # tail block if file ended without 'Loop time'
+    return blocks
+
+
+def query_thermo(blocks: List[Dict[int, Dict[str, float]]],
+                 target_temp: Optional[int],
+                 step: int) -> Optional[Dict[str, float]]:
+    """Look up a thermo row by ``(target_temp, step)`` across run blocks.
+
+    ``target_temp`` is the nominal temperature parsed from the dump filename
+    (e.g. ``NPT.200.100000`` -> ``200``). For constant-T runs, this picks
+    the block whose mean Temp is closest to ``target_temp`` among blocks
+    containing ``step``. ``target_temp=None`` (ramping runs) returns the
+    first match. Returns ``None`` if no block contains ``step`` or if the
+    closest block is more than 50 K off ``target_temp`` (likely a wrong
+    filename-to-block mapping).
+    """
+    if not blocks:
+        return None
+    candidates = [b for b in blocks if step in b]
+    if not candidates:
+        return None
+    if target_temp is None:
+        return candidates[0][step]
+
+    def _mean_temp(b: Dict[int, Dict[str, float]]) -> float:
+        vals = [r.get('Temp') for r in b.values() if r.get('Temp') is not None]
+        return sum(vals) / len(vals) if vals else float('inf')
+
+    best = min(candidates, key=lambda b: abs(_mean_temp(b) - target_temp))
+    if abs(_mean_temp(best) - target_temp) > 50:
+        return None
+    return best[step]
+
+
+def parse_lammps_log(log_file: str) -> List[float]:
+    """Parse LAMMPS ``log.lammps`` and return per-step temperatures (Kelvin).
+
+    Backwards-compatible with the original ``List[float]`` contract used by
+    :func:`run_extract`. Iterates every thermo row in file order across all
+    run blocks (so a step that repeats across blocks produces one entry per
+    block, preserving the original behaviour for ramping-run T(t) extraction).
+    """
+    temps: List[float] = []
+    for block in parse_lammps_thermo(log_file):
+        for row in block.values():
+            if 'Temp' in row:
+                temps.append(row['Temp'])
     return temps
 
 

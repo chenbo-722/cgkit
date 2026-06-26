@@ -18,4 +18,5 @@ __all__ = [
     "fparam",
     "analyze_cg",
     "analyze_atomic",
+    "pt_plot",
 ]
