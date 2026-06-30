@@ -72,10 +72,12 @@ pip install numpy pandas tqdm
 | `to-deepmd`          | _(none beyond required)_                                                 |
 | `fparam extract`     | _(none beyond required)_                                                 |
 | `fparam const`       | _(none beyond required)_                                                 |
+| `cg-verify`          | _(none beyond required)_                                                 |
 | `analyze-cg`         | `matplotlib`, `scipy`                                                    |
 | `analyze-atomic`     | `matplotlib`, `scipy`, `scikit-learn`, `networkx` (optional)             |
 | `analyze-atomic` (SOAP)  | + `ase`, `dscribe`                                                   |
 | `analyze-atomic` (GNN)   | + `torch`, `torch-geometric` (falls back to random embeddings)       |
+| `analyze-atomic` (UMAP)  | + `umap-learn` (falls back to skipping UMAP step)                    |
 
 Heavy packages are **lazy-loaded**: `import cglib` and any non-analysis
 subcommand will succeed with just `numpy/pandas/tqdm` installed. The
@@ -131,10 +133,40 @@ particle / box CSV files plus optional CG dump trajectories.
 --sim NAME [NAME...] filter simulations
 --temp K [K...]      override temperatures
 --workers N          parallel workers
+--r-cutoff Å         pattern-matching cutoff radius (default: from config, 1.25)
+--unwrap-pbc         enable chain-style PBC unwrap before CG matching
+--no-unwrap-pbc      disable PBC unwrap (use raw wrapped coords)
 ```
 
+**PBC unwrap behavior:** when `coarse_graining.unwrap_pbc=true` (default in
+shipped configs), each atomic frame is run through `_unwrap_chain_coords`
+— a by-id-order minimum-image fold that reconstructs physical coordinates
+across periodic boundaries before pattern matching. This eliminates the
+classic "wrapped-coordinate artifact picks two atoms on opposite sides of
+the box" failure mode. The unwrap assumes consecutive atom ids are
+chemically bonded (true for bonded dumps ordered by molecule); dumps that
+list all C first then all H may not benefit. Override per-run with
+`--no-unwrap-pbc`.
+
+**`r_cutoff` distance cutoff:** when set (default `1.25` Å), type-2
+candidates outside `r_cutoff` from a center atom are dropped before
+nearest-neighbor selection. This prevents a center from "stealing" a
+distant H that rightfully belongs to a nearer center. Set to `null` for
+unlimited range (pre-upgrade behavior).
+
+**`id_patterns` (id-offset binding):** optional intermediate layer between
+`cg_assignments` (per-id manual) and `patterns` (per-distance automatic).
+Each rule is `{type_pattern, id_offsets, cg_type}` where `id_offsets[i]`
+is the signed offset from the center atom's id to the i-th member atom
+(`id_offsets[0]` must be 0). Priority order: **cg_assignments →
+id_patterns → patterns**. Useful for dumps with a uniform id layout
+(e.g. `center_id+1, center_id+2` for the two H on each CH₂).
+
 **Per-trajectory outputs:** `<basename>_particles.csv`,
-`<basename>_box_vectors.csv`, optionally `<basename>_cg.lammpstrj`.
+`<basename>_box_vectors.csv`, optionally `<basename>_cg.lammpstrj`. The
+particles CSV gains a `match_status` column (`manual` / `id_pattern` /
+`pattern`) recording which stage produced each CG bead, plus an
+`id_pattern` column with the matched rule when applicable.
 
 ---
 
@@ -217,30 +249,39 @@ distributions, per-temperature breakdowns, time-series, and overview figures.
 
 ### `cgkit analyze-atomic`  *(legacy `0x-analyze_atomic_structure.py`)*
 
-SOAP descriptors → PCA → t-SNE → clustering (DBSCAN/KMeans) pipeline, with
-optional PyTorch GNN embeddings and graph topology visualization. Operates on
-either CG trajectories (`--mode cg`, reads `*_cg.lammpstrj`) or atomic dumps
-(`--mode aa`).
+SOAP descriptors → PCA → t-SNE → **UMAP** → clustering (DBSCAN/KMeans) pipeline,
+with optional PyTorch GNN embeddings and graph topology visualization. Operates
+on either CG trajectories (`--mode cg`, reads `*_cg.lammpstrj`) or atomic dumps
+(`--mode aa`). UMAP is an optional step (requires `pip install -e ".[umap]"`);
+when `umap-learn` is unavailable the pipeline prints a warning and skips UMAP
+without affecting PCA/t-SNE/clustering.
 
-**Config sections read:** `analysis_atomic.*` (`soap`, `pca`, `tsne`,
+**Config sections read:** `analysis_atomic.*` (`soap`, `pca`, `tsne`, `umap`,
 `clustering`, `gnn_*`, `max_frames`, `max_per_file`, `output_dir`),
-`paths.{cg,aa}_data_base_dir`, `simulations`.
+`paths.{cg,aa}_data_base_dir`, `simulations`. The new `analysis_atomic.umap`
+subsection accepts `n_components` (default 5), `n_neighbors` (15), `min_dist`
+(0.1), `metric` (`'euclidean'`); `analysis_atomic.clustering.space` selects
+the projection fed to clustering (`pca` / `tsne` / `umap`, default `pca`).
 
 **CLI:**
 ```
---mode {cg,aa}       analysis mode (default from config)
---base-dir DIR       override CG/AA base dir (chosen by --mode)
---output-dir DIR     override analysis_atomic.output_dir
---max-frames N       cap total frames
---max-per-file N     cap frames per trajectory file (CG mode)
---sim/--temp/--workers common
+--mode {cg,aa}            analysis mode (default from config)
+--base-dir DIR            override CG/AA base dir (chosen by --mode)
+--output-dir DIR          override analysis_atomic.output_dir
+--max-frames N            cap total frames
+--max-per-file N          cap frames per trajectory file (CG mode)
+--cluster-space {pca,tsne,umap}  projection fed to clustering
+                                  (overrides analysis_atomic.clustering.space)
+--sim/--temp/--workers    common
 ```
 
-**Outputs:** `pca_results.csv`, `tsne_results.csv`, `descriptors.csv`,
-`outlier_structures.csv`, plus PNG figures under `figures/`. Since v2 all
-CSVs end with the tracing columns `structure_id, source_file, temp` so any
-point in PCA/t-SNE/cluster space can be mapped back to its original dump
-frame (`structure_id` format: `<sim>/<temp|ramp>@<timestep>`).
+**Outputs:** `pca_results.csv`, `tsne_results.csv`, `umap_results.csv`,
+`descriptors.csv`, `outlier_structures.csv`, plus PNG figures under `figures/`
+(including `umap_overall.png` / `umap_<sim>.png` when UMAP runs). In CG mode
+the files are prefixed `CG_` (e.g. `CG_umap_results.csv`). Since v2 all CSVs
+end with the tracing columns `structure_id, source_file, temp` so any point in
+PCA/t-SNE/UMAP/cluster space can be mapped back to its original dump frame
+(`structure_id` format: `<sim>/<temp|ramp>@<timestep>`).
 
 ---
 
@@ -273,6 +314,141 @@ temperature sweeps).
 
 ---
 
+### `cgkit select-structures`  *(new module)*
+
+Re-clusters a `pca_results.csv` / `tsne_results.csv` / `umap_results.csv`
+(produced by `cgkit analyze-atomic`) and, for each cluster, picks **N
+maximally-spread structures** via maximin (farthest-point) sampling. Each
+selected frame is extracted from its source LAMMPS dump into a standalone
+`.lammpstrj` in the output directory, plus a `selection_manifest.csv` records
+every pick. This is the standard workflow for selecting a diverse,
+representative training subset.
+
+**Workflow:** `cgkit analyze-atomic` (once, produces the projection CSV) →
+`cgkit select-structures` (iterate on `--n-clusters` / `--n` freely; no need
+to re-run the expensive SOAP/PCA pipeline).
+
+**Config sections read:** `select_structures.*`
+(`input`, `output_dir`, `method`, `space`, `n_clusters`, `min_samples`,
+`include_noise`, `seed`).
+
+**CLI:**
+```
+--input FILE         input CSV (pca_results.csv / tsne_results.csv /
+                     umap_results.csv / CG variants)
+--output-dir DIR     where selected dumps + selection_manifest.csv go
+--n N                (required) structures to pick per cluster
+--space {pca,tsne,umap}   projection space (default: auto-detect from
+                          columns; priority PCA > UMAP > t-SNE)
+--method {kmeans,dbscan}   default kmeans
+--n-clusters K       KMeans cluster count (default 8)
+--eps FLOAT          DBSCAN epsilon (default: 30th pct of pairwise distances)
+--min-samples N      DBSCAN min_samples (default 5)
+--include-noise      treat DBSCAN noise (label -1) as a selectable cluster
+--seed N             KMeans random seed (default 42)
+```
+
+**Outputs** (under `<output_dir>/`):
+- One `.lammpstrj` per selected frame — filename = sanitized `structure_id`
+  (e.g. `1-npt_200_100000.lammpstrj`), containing that single timestep's
+  atoms/box in standard LAMMPS dump format.
+- `selection_manifest.csv` — columns
+  `structure_id, cluster, selection_rank, source_file, timestep, temp,
+  <PC1..PCk or tSNE1..tSNEk>, output_file`.
+
+**Algorithm:** within each cluster, the first pick is the point nearest the
+cluster centroid (deterministic); each subsequent pick maximises the minimum
+distance to already-chosen points (classic FPS / maximin). Clusters smaller
+than N contribute all their members (with a `[small-cluster]` notice).
+
+---
+
+### `cgkit cg-verify`  *(new module)*
+
+Cross-checks CG particle CSV files (`*_particles.csv`) against their source
+LAMMPS atomic dumps. Designed to catch CG-generation bugs — especially the
+classic "wrapped-coordinate pattern matching picks atoms on opposite sides
+of a periodic boundary" failure mode.
+
+Two modes:
+
+- **`--mode auto` (default)** — runs four checks per CG CSV:
+  1. **`pbc`** — flags CG particles whose member atoms span > `--pbc-thresh`
+     (default 45%) of a periodic box length. Warns at > 22.5%. Skips
+     `manual_assignment=True` rows (manual assignments may legitimately
+     cross boundaries).
+  2. **`conservation`** — re-computes each CG particle's position (center
+     atom copy), force, and PE from the atomic data using the same formula
+     as `cg_gen.create_cg_particle`, and compares against the stored CSV
+     values. Tolerances: `--force-tol` (default 1e-4 eV/Å), `--pe-tol`
+     (default 1e-6 eV), position compared via minimum-image PBC difference
+     (so stored wrapped or unwrapped coordinates both validate correctly).
+     When `coarse_graining.unwrap_pbc=true`, the atomic frame is unwrapped
+     with the same chain logic before recompute.
+  3. **`coverage`** — every atomic row must appear in exactly one CG
+     particle's `atom_indices`. Reports missing atoms and duplicates.
+  4. **`manual`** — every entry in `coarse_graining.cg_assignments` must
+     correspond to exactly one `manual_assignment=True` CG row with
+     matching atom IDs and CG type; undeclared manual rows are reported
+     as warnings.
+- **`--mode manual --atoms ID1 ID2 ...`** — for each user-supplied atomic
+  ID, prints which CG particle owns it, the sibling member IDs, the CG
+  position, the atom's own position, and a quick PBC-span flag. Useful for
+  tracking down specific atoms flagged by `--mode auto`.
+
+**File discovery:** by default verifies the first sorted `*_particles.csv`
+under `paths.cg_data_base_dir/<sim>/` (after `--sim`/`--temp` filtering).
+Pass `--all` to scan every file, `--file PATH` to override, or
+`--max-files N` to cap an `--all` scan.
+
+**Atomic source resolution:** strips `_particles.csv` from the CG filename
+and searches under `paths.aa_data_base_dir` (override with `--atomic-dir`)
+in the sim's `trajectory_dir` / `data_subdir` / `output_subdir`, then
+recursively as a fallback.
+
+**Config sections read:** `verify_cg.*`
+(`output_dir`, `checks`, `force_tolerance`, `pe_tolerance`,
+`pbc_span_threshold`), `paths.{cg,aa}_data_base_dir`,
+`coarse_graining.{position_source,average_forces,average_potential_energy,cg_assignments,unwrap_pbc,r_cutoff,id_patterns}`,
+`simulations`.
+
+**CLI:**
+```
+--mode {auto,manual}        auto = full 4-check scan (default);
+                            manual = look up --atoms IDs
+--atoms ID [ID...]          atomic IDs to look up (manual mode only)
+--file PATH | --all         single explicit file (mutex) | scan all enabled sims
+--max-files N               cap an --all scan
+--base-dir DIR              override paths.cg_data_base_dir (CG CSV root)
+--atomic-dir DIR            override paths.aa_data_base_dir (atomic dump root)
+--output-dir DIR            where to write cg_verify_report.csv
+--checks C [C...]           subset of {pbc,conservation,coverage,manual}
+--force-tol TOL             force recompute tolerance in eV/Å (default 1e-4)
+--pe-tol TOL                PE recompute tolerance in eV (default 1e-6)
+--pbc-thresh FRAC           PBC-span FAIL threshold as fraction of L (default 0.45)
+--no-csv                    skip writing cg_verify_report.csv
+--failures-only             only write FAIL rows to the CSV report
+--quiet, -q                 only print per-file block when a file has FAILs
+--sim/--temp/--workers      common
+```
+
+**Outputs:**
+- stdout: per-file human-readable report (frame-by-frame FAIL/WARN counts,
+  worst-case recompute errors) + final summary.
+- `<output_dir>/cg_verify_report.csv` (only when there are issues): one
+  row per issue with columns `file, sim, temp, timestep, check, severity,
+  cg_id, message, n_atoms, member_atom_ids, force_err, pe_err, pos_err,
+  pbc_span_frac_{x,y,z}`.
+
+**Exit codes:**
+- `0` — all checks pass (WARNs allowed)
+- `1` — at least one FAIL
+- `2` — file-level error (atomic source missing / unparseable / timestep
+  mismatch) prevents any verification
+- `3` — CLI usage error (e.g. `--mode manual` without `--atoms`)
+
+---
+
 ## 4. Configuration (`config.json`)
 
 The unified config has 8 top-level sections (plus `description`/`version`):
@@ -292,7 +468,10 @@ The unified config has 8 top-level sections (plus `description`/`version`):
   "deepmd":               { /* num_groups, use_type_column */ },
   "fparam":               { /* unit, extract.sim_names, const.{sim_names,temperatures} */ },
   "analysis_cg":          { /* sample, max_files, output_dir */ },
-  "analysis_atomic":      { /* mode, max_frames, max_per_file, soap, pca, tsne, clustering, gnn_* */ },
+  "analysis_atomic":      { /* mode, max_frames, max_per_file, soap, pca, tsne, umap, clustering{space,...}, gnn_* */ },
+  "plot_pt":              { /* output_dir, max_frames */ },
+  "select_structures":    { /* input, output_dir, method, space, n_clusters, min_samples, include_noise, seed */ },
+  "verify_cg":            { /* output_dir, checks, force_tolerance, pe_tolerance, pbc_span_threshold */ },
   "processing":           { /* parallel, max_workers, trajectory_filter */ },
   "output":               { /* save_particles, save_box_vectors, save_raw_files, save_npy_files */ }
 }
@@ -302,13 +481,24 @@ The unified config has 8 top-level sections (plus `description`/`version`):
 
 `cgkit` writes CLI overrides into the *right* config key per subcommand:
 
-| CLI flag             | cg-gen                   | to-deepmd                   | fparam extract              | fparam const                 | analyze-cg                 | analyze-atomic                | plot-pt                       |
-|----------------------|--------------------------|-----------------------------|-----------------------------|------------------------------|----------------------------|-------------------------------|-------------------------------|
-| `--base-dir DIR`     | `paths.base_dir`         | `paths.cg_data_base_dir`    | _(n/a)_                     | `paths.deepmd_output_base_dir` | `paths.cg_data_base_dir`  | `paths.{cg,aa}_data_base_dir` | `paths.aa_data_base_dir`      |
-| `--output-dir DIR`   | `paths.cg_data_base_dir` | `paths.deepmd_output_base_dir` | `paths.deepmd_output_base_dir` | _(n/a)_                  | `analysis_cg.output_dir`   | `analysis_atomic.output_dir`  | `plot_pt.output_dir`          |
-| `--log-dir DIR`      | _(n/a)_                  | _(n/a)_                     | `paths.log_dir`             | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | `paths.log_dir`               |
+| CLI flag             | cg-gen                   | to-deepmd                   | fparam extract              | fparam const                 | analyze-cg                 | analyze-atomic                | plot-pt                       | select-structures             |
+|----------------------|--------------------------|-----------------------------|-----------------------------|------------------------------|----------------------------|-------------------------------|-------------------------------|-------------------------------|
+| `--input FILE`       | _(n/a)_                  | _(n/a)_                     | _(n/a)_                     | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | _(n/a)_                       | `select_structures.input`     |
+| `--base-dir DIR`     | `paths.base_dir`         | `paths.cg_data_base_dir`    | _(n/a)_                     | `paths.deepmd_output_base_dir` | `paths.cg_data_base_dir`  | `paths.{cg,aa}_data_base_dir` | `paths.aa_data_base_dir`      | _(n/a)_                       |
+| `--output-dir DIR`   | `paths.cg_data_base_dir` | `paths.deepmd_output_base_dir` | `paths.deepmd_output_base_dir` | _(n/a)_                  | `analysis_cg.output_dir`   | `analysis_atomic.output_dir`  | `plot_pt.output_dir`          | `select_structures.output_dir`|
+| `--log-dir DIR`      | _(n/a)_                  | _(n/a)_                     | `paths.log_dir`             | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | `paths.log_dir`               | _(n/a)_                       |
 
 Mapping lives in `cglib/config.py::COMMAND_PATH_OVERRIDES`.
+
+`cgkit cg-verify` resolves its own overrides inside `cg_verify._resolve_settings`
+(same convention, cg-verify-specific flag set): `--base-dir` →
+`paths.cg_data_base_dir`, `--atomic-dir` → `paths.aa_data_base_dir`,
+`--output-dir` → `verify_cg.output_dir`.
+
+`cgkit cg-gen` resolves three further overrides inside `cg_gen.run` (not via
+`COMMAND_PATH_OVERRIDES` because they target `coarse_graining.*` rather than
+`paths.*`): `--r-cutoff` → `coarse_graining.r_cutoff`, `--unwrap-pbc` /
+`--no-unwrap-pbc` → `coarse_graining.unwrap_pbc`.
 
 ---
 
@@ -329,6 +519,8 @@ from cglib.deepmd_conv  import process_simulation as to_deepmd_process_simulatio
 from cglib.fparam       import run_extract, run_const, parse_lammps_log
 from cglib.analyze_cg   import CGDataAnalyzer
 from cglib.analyze_atomic import AtomicStructureAnalyzer, StructureDescriptor, GraphNeuralNetwork
+from cglib.cg_verify    import (verify_pbc_span, verify_conservation,
+                                verify_coverage, verify_manual_fidelity)
 ```
 
 **LAMMPS reader API (unified):**

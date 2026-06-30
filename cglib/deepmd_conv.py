@@ -89,13 +89,17 @@ def _process_one_case(task: Tuple[str, str],
 
 
 def _worker(task):
-    """Picklable top-level wrapper for ProcessPoolExecutor."""
+    """Picklable top-level wrapper for ProcessPoolExecutor.
+
+    Returns the ``run_parallel`` 3-tuple ``(ok, msg, result)`` — the task
+    payload is prepended by the caller, so we must NOT include ``pair`` here.
+    """
     pair, conv_config = task
     try:
         result = _process_one_case(pair, conv_config)
-        return pair, True, '', result
+        return True, '', result
     except Exception as exc:  # noqa: BLE001
-        return pair, False, str(exc), {}
+        return False, str(exc), {}
 
 
 # =============================================================================
@@ -153,7 +157,7 @@ def process_simulation(sim_config: Dict[str, Any],
         all_box: List[np.ndarray] = []
         all_types: List[np.ndarray] = []
 
-        for pair, ok, msg, result in results:
+        for task, ok, msg, result in results:
             if ok:
                 all_coords.append(result['coords'])
                 all_forces.append(result['forces'])
@@ -165,6 +169,7 @@ def process_simulation(sim_config: Dict[str, Any],
                 stats['total_particles'] += result['n_particles']
             else:
                 stats['failed'] += 1
+                pair = task[0]  # task = (pair, conv_config); pair = (particles, box)
                 stats['errors'].append(f"{os.path.basename(pair[0])}: {msg}")
 
         if not all_coords:

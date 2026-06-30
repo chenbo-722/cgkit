@@ -52,6 +52,10 @@ COMMAND_PATH_OVERRIDES: Dict[str, Dict[str, str]] = {
         "output_dir": "plot_pt.output_dir",
         "log_dir":    "paths.log_dir",
     },
+    "select-structures": {
+        "output_dir": "select_structures.output_dir",
+        "input":      "select_structures.input",
+    },
 }
 
 

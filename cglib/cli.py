@@ -40,8 +40,9 @@ Examples:
   cgkit fparam extract                      # T(t) from LAMMPS logs -> fparam
   cgkit fparam const --unit K               # constant-T fparam in Kelvin
   cgkit analyze-cg                          # statistical CG analysis
-  cgkit analyze-atomic --mode cg            # SOAP/PCA/t-SNE on CG trajectories
+  cgkit analyze-atomic --mode cg            # SOAP/PCA/t-SNE/UMAP on CG trajectories
   cgkit plot-pt                             # P-T coverage scatter from log.lammps
+  cgkit select-structures --input pca_results.csv --n 3 --output-dir sel/
 """,
     )
     sub = parser.add_subparsers(dest='command', required=True, metavar='<command>')
@@ -58,6 +59,18 @@ Examples:
                          help='Override paths.base_dir (01.aa atomic simulations).')
     p_cggen.add_argument('--output-dir', type=str, default=None,
                          help='Override paths.cg_data_base_dir (CG CSV output).')
+    p_cggen.add_argument('--r-cutoff', type=float, default=None, metavar='Å',
+                         help='Pattern-matching cutoff radius in Ångström '
+                              '(only consider type-2 atoms within this radius of '
+                              'a center atom). Overrides config r_cutoff. '
+                              'Default: no cutoff.')
+    p_cggen.add_argument('--unwrap-pbc', dest='unwrap_pbc',
+                         action='store_true', default=None,
+                         help='Apply chain-style PBC unwrap to atomic coords '
+                              'before CG matching (overrides config unwrap_pbc).')
+    p_cggen.add_argument('--no-unwrap-pbc', dest='unwrap_pbc',
+                         action='store_false', default=None,
+                         help='Disable PBC unwrap (use raw wrapped coords).')
 
     # --- to-deepmd ---------------------------------------------------------
     p_deepmd = sub.add_parser(
@@ -118,9 +131,11 @@ Examples:
     # --- analyze-atomic ----------------------------------------------------
     p_anat = sub.add_parser(
         'analyze-atomic',
-        help='SOAP/PCA/t-SNE/GNN analysis (legacy 0x-analyze_atomic_structure)',
-        description='Run SOAP descriptor + PCA + t-SNE + clustering pipeline on '
-                    'either CG trajectories (mode=cg) or atomic dumps (mode=aa).',
+        help='SOAP/PCA/t-SNE/UMAP/GNN analysis (legacy 0x-analyze_atomic_structure)',
+        description='Run SOAP descriptor + PCA + t-SNE + UMAP + clustering '
+                    'pipeline on either CG trajectories (mode=cg) or atomic '
+                    'dumps (mode=aa). UMAP requires the optional umap-learn '
+                    'dependency (pip install -e ".[umap]").',
     )
     add_common_args(p_anat)
     p_anat.add_argument('--mode', choices=['cg', 'aa'], default=None,
@@ -133,6 +148,12 @@ Examples:
                         help='Cap on total frames analysed.')
     p_anat.add_argument('--max-per-file', type=int, default=None, metavar='N',
                         help='Cap on frames per trajectory file (CG mode only).')
+    p_anat.add_argument('--cluster-space', choices=['pca', 'tsne', 'umap'],
+                        default=None,
+                        help='Projection space fed to clustering (overrides '
+                             'analysis_atomic.clustering.space; default pca). '
+                             'tsne/umap fall back to pca if the corresponding '
+                             'result is unavailable.')
 
     # --- plot-pt -----------------------------------------------------------
     p_pt = sub.add_parser(
@@ -152,6 +173,103 @@ Examples:
                       help='Override paths.log_dir (root holding <sim>/log.lammps).')
     p_pt.add_argument('--max-frames', type=int, default=None, metavar='N',
                       help='Cap on total frames plotted (uniform downsample).')
+
+    # --- select-structures -------------------------------------------------
+    p_sel = sub.add_parser(
+        'select-structures',
+        help='Cluster PCA/t-SNE/UMAP results and copy N diverse frames per cluster',
+        description='Re-cluster a pca_results.csv / tsne_results.csv / '
+                    'umap_results.csv (from `cgkit analyze-atomic`) and, for '
+                    'each cluster, pick N maximally-spread structures (maximin '
+                    'sampling), then copy each selected frame out of its source '
+                    'dump as a standalone LAMMPS dump file.',
+    )
+    add_common_args(p_sel)
+    p_sel.add_argument('--input', type=str, default=None,
+                       help='Input CSV (pca_results.csv / tsne_results.csv / '
+                            'umap_results.csv / CG variants) from '
+                            '`cgkit analyze-atomic`.')
+    p_sel.add_argument('--output-dir', type=str, default=None,
+                       help='Where to write the selected dump files + '
+                            'selection_manifest.csv.')
+    p_sel.add_argument('--n', type=int, required=True, metavar='N',
+                       help='Structures to select per cluster.')
+    p_sel.add_argument('--space', choices=['pca', 'tsne', 'umap'], default=None,
+                       help='Projection space to cluster in (default: '
+                            'auto-detect from column names; priority PCA > '
+                            'UMAP > t-SNE).')
+    p_sel.add_argument('--method', choices=['kmeans', 'dbscan'], default=None,
+                       help='Clustering algorithm (default: kmeans).')
+    p_sel.add_argument('--n-clusters', type=int, default=None, metavar='K',
+                       help='KMeans cluster count (default: 8).')
+    p_sel.add_argument('--eps', type=float, default=None,
+                       help='DBSCAN epsilon (default: 30th pct of pairwise '
+                            'distances).')
+    p_sel.add_argument('--min-samples', type=int, default=None, metavar='N',
+                       help='DBSCAN min_samples (default: 5).')
+    p_sel.add_argument('--include-noise', action='store_true', default=False,
+                       help='Treat DBSCAN noise (label -1) as a selectable '
+                            'cluster (default: skip noise).')
+    p_sel.add_argument('--seed', type=int, default=None, metavar='N',
+                       help='KMeans random seed (default: 42).')
+
+    # --- cg-verify ---------------------------------------------------------
+    p_verify = sub.add_parser(
+        'cg-verify',
+        help='Validate CG CSV outputs against atomic source dumps',
+        description='Cross-check CG particle CSV files against their source '
+                    'LAMMPS atomic dumps. Auto mode (default) runs four '
+                    'checks: PBC-span detection, force/energy/position '
+                    'conservation recompute, atom coverage, and manual-'
+                    'assignment fidelity. Manual mode looks up which CG '
+                    'particle owns each user-supplied atom ID.',
+    )
+    add_common_args(p_verify)
+    p_verify.add_argument('--mode', choices=['auto', 'manual'], default=None,
+                          help='auto = full 4-check scan; manual = look up '
+                               'which CG particle owns each --atoms ID '
+                               '(default: auto).')
+    p_verify.add_argument('--atoms', type=int, nargs='+', default=None,
+                          metavar='ID',
+                          help='Atomic IDs to look up (manual mode only).')
+    # Scope: --file and --all are mutually exclusive.
+    scope = p_verify.add_mutually_exclusive_group()
+    scope.add_argument('--file', type=str, default=None, metavar='PATH',
+                       help='Explicit single CG CSV to verify '
+                            '(overrides --sim/--temp filtering).')
+    scope.add_argument('--all', action='store_true', default=False,
+                       help="Scan every enabled sim's CG CSVs, not just "
+                            'the first sorted one.')
+    p_verify.add_argument('--max-files', type=int, default=None, metavar='N',
+                          help='With --all, cap the number of files to scan.')
+    p_verify.add_argument('--base-dir', type=str, default=None,
+                          help='Override paths.cg_data_base_dir (CG CSV root).')
+    p_verify.add_argument('--atomic-dir', type=str, default=None,
+                          help='Override paths.aa_data_base_dir '
+                               '(atomic dump root).')
+    p_verify.add_argument('--output-dir', type=str, default=None,
+                          help='Where to write cg_verify_report.csv.')
+    p_verify.add_argument('--checks', type=str, nargs='+', default=None,
+                          choices=['pbc', 'conservation', 'coverage', 'manual'],
+                          help='Subset of checks (default: all four).')
+    p_verify.add_argument('--force-tol', type=float, default=None,
+                          metavar='TOL',
+                          help='Force recompute tolerance in eV/Å '
+                               '(default: 1e-4).')
+    p_verify.add_argument('--pe-tol', type=float, default=None, metavar='TOL',
+                          help='Potential-energy recompute tolerance in eV '
+                               '(default: 1e-6).')
+    p_verify.add_argument('--pbc-thresh', type=float, default=None,
+                          metavar='FRAC',
+                          help='PBC-span FAIL threshold as a fraction of box '
+                               'length (default: 0.45).')
+    p_verify.add_argument('--no-csv', action='store_true', default=False,
+                          help='Skip writing cg_verify_report.csv.')
+    p_verify.add_argument('--failures-only', action='store_true', default=False,
+                          help='Only write FAIL rows to the CSV report.')
+    p_verify.add_argument('--quiet', '-q', action='store_true', default=False,
+                          help='Only print per-file block when a file has '
+                               'FAILs.')
 
     return parser
 

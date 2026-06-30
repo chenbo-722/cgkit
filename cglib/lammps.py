@@ -16,6 +16,7 @@ does not change:
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -210,3 +211,74 @@ class LammpsDumpReader:
             'energies': energies,
             'forces': forces,
         }
+
+
+# =============================================================================
+# Frame writer (symmetric with parse_file)
+# =============================================================================
+
+def write_lammps_frame(frame: LammpsFrame, output_path: str) -> None:
+    """Write a single ``LammpsFrame`` to a LAMMPS dump file.
+
+    The output format is the mirror image of what :meth:`parse_file` consumes::
+
+        ITEM: TIMESTEP
+        <timestep>
+        ITEM: NUMBER OF ATOMS
+        <natoms>
+        ITEM: BOX BOUNDS pp pp pp
+        <xlo> <xhi> <xy_tilt>
+        <ylo> <yhi> <xz_tilt>
+        <zlo> <zhi> <yz_tilt>
+        ITEM: ATOMS <columns...>
+        <one row per atom>
+
+    ``frame.box_bounds`` is stored as ``[[xlo,xhi],[ylo,yhi],[zlo,zhi]]``
+    (2 entries per axis, matching the parser). We append a ``0.0`` tilt column
+    so each BOX BOUNDS line has 3 floats — the standard orthogonal-box form.
+    """
+    from .paths import ensure_dir
+
+    ensure_dir(os.path.dirname(os.path.abspath(output_path)) or '.')
+
+    box = frame.box_bounds
+    # Each axis: [lo, hi] (+ optional tilt we don't store); pad tilt with 0.0.
+    # repr() = shortest string that round-trips to the same double.
+    box_lines = []
+    for axis in range(3):
+        lo = float(box[axis][0])
+        hi = float(box[axis][1])
+        tilt = float(box[axis][2]) if len(box[axis]) > 2 else 0.0
+        box_lines.append(f"{lo!r} {hi!r} {tilt!r}")
+
+    columns = frame.columns
+
+    with open(output_path, "w") as f:
+        f.write("ITEM: TIMESTEP\n")
+        f.write(f"{frame.timestep}\n")
+        f.write("ITEM: NUMBER OF ATOMS\n")
+        f.write(f"{frame.natoms}\n")
+        f.write("ITEM: BOX BOUNDS pp pp pp\n")
+        for line in box_lines:
+            f.write(line + "\n")
+        f.write("ITEM: ATOMS " + " ".join(columns) + "\n")
+        for atom in frame.atoms:
+            row = [_format_atom_value(atom.get(col)) for col in columns]
+            f.write(" ".join(row) + "\n")
+
+
+def _format_atom_value(value) -> str:
+    """Render an atom-field value back to dump text.
+
+    Integer-valued fields (id, type) print without trailing ``.0``; all other
+    floats use ``repr()`` which gives the shortest string that parses back to
+    the exact same double (Python 3 float repr contract) — i.e. lossless
+    roundtrip. ``None``/missing values become ``0`` to keep the column count
+    consistent.
+    """
+    if value is None:
+        return "0"
+    iv = int(value)
+    if iv == value:
+        return str(iv)
+    return repr(float(value))

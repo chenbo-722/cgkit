@@ -64,6 +64,10 @@
     "average_potential_energy": true,
     "export_cg_trajectory": true,
     "cg_trajectory_filename": "{basename}_cg.lammpstrj",
+    "unwrap_pbc": true,
+    "unwrap_method": "chain",
+    "r_cutoff": 1.25,
+    "id_patterns": [],
     "cg_assignments": [
       {"atom_ids": [1, 401, 402, 403], "cg_type": 2, "description": "4 atoms -> type 2"},
       {"atom_ids": [400, 1200, 1201, 1202], "cg_type": 2, "description": "4 atoms -> type 2"}
@@ -103,12 +107,32 @@
     "soap":      {"rcut": 5.0, "n_max": 8, "l_max": 6, "sigma": 0.5},
     "pca":       {"n_components": 10},
     "tsne":      {"n_components": 2, "perplexity": 30, "max_iter": 1000},
-    "clustering": {"method": "dbscan", "min_samples": 5, "n_clusters": 4}
+    "umap":      {"n_components": 5, "n_neighbors": 15, "min_dist": 0.1, "metric": "euclidean"},
+    "clustering": {"method": "dbscan", "space": "pca", "min_samples": 5, "n_clusters": 4}
   },
 
   "plot_pt": {
     "output_dir": "/mnt/d/Workbench/CH_CG/0x.cgdata_analysis/pt_overview",
     "max_frames": 2000
+  },
+
+  "select_structures": {
+    "input": null,
+    "output_dir": null,
+    "method": "kmeans",
+    "space": "pca",
+    "n_clusters": 8,
+    "min_samples": 5,
+    "include_noise": false,
+    "seed": 42
+  },
+
+  "verify_cg": {
+    "output_dir": null,
+    "checks": ["pbc", "conservation", "coverage", "manual"],
+    "force_tolerance": 1.0e-4,
+    "pe_tolerance": 1.0e-6,
+    "pbc_span_threshold": 0.45
   },
 
   "processing": {

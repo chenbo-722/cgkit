@@ -24,11 +24,13 @@ atomic  = ["matplotlib", "scipy", "scikit-learn"]
 soap    = ["ase", "dscribe"]
 gnn     = ["torch", "torch-geometric"]
 networkx = ["networkx"]
+umap    = ["umap-learn>=0.5"]
 all     = [
     "matplotlib", "scipy", "scikit-learn",
     "ase", "dscribe",
     "torch", "torch-geometric",
     "networkx",
+    "umap-learn>=0.5",
 ]
 
 # Creates a `cgkit` executable on PATH that calls cgkit.py:main()

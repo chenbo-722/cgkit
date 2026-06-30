@@ -60,6 +60,47 @@ def calculate_distance(pos1: Dict[str, float], pos2: Dict[str, float],
     return dx * dx + dy * dy + dz * dz
 
 
+def _unwrap_chain_coords(df: pd.DataFrame,
+                         box_bounds: List[List[float]]) -> pd.DataFrame:
+    """按 id 顺序做链式 PBC unwrap，原地覆写 x/y/z（同步 xu/yu/zu）。
+
+    对每个原子 i>0（按 id 升序），若与前一原子在某轴的位移超过半个盒长，
+    则 ±L 折叠，使整条链在物理空间连续。PE 等线性共价体系下等价于
+    重建分子链；对均匀液体（无链序）可能产生伪连续，应通过
+    ``coarse_graining.unwrap_pbc=false`` 关闭。
+
+    返回传入的 df（已就地修改），便于链式调用。
+    """
+    if df is None or len(df) == 0:
+        return df
+    Lx = box_bounds[0][1] - box_bounds[0][0]
+    Ly = box_bounds[1][1] - box_bounds[1][0]
+    Lz = box_bounds[2][1] - box_bounds[2][0]
+    if Lx <= 0 or Ly <= 0 or Lz <= 0:
+        return df  # 盒子异常，跳过
+
+    if 'id' in df.columns:
+        order = df.sort_values('id').index.tolist()
+    else:
+        order = df.index.tolist()
+
+    for col, L in (('x', Lx), ('y', Ly), ('z', Lz)):
+        if col not in df.columns:
+            continue
+        vals = df.loc[order, col].astype(float).values.copy()
+        for i in range(1, len(vals)):
+            d = vals[i] - vals[i - 1]
+            vals[i] -= round(d / L) * L
+        df.loc[order, col] = vals
+
+    # 同步 xu/yu/zu（若存在），保证下游所有读取路径一致
+    for ucol, col in (('xu', 'x'), ('yu', 'y'), ('zu', 'z')):
+        if ucol in df.columns and col in df.columns:
+            df[ucol] = df[col]
+
+    return df
+
+
 # =============================================================================
 # Coarse-graining
 # =============================================================================
@@ -67,8 +108,13 @@ def calculate_distance(pos1: Dict[str, float], pos2: Dict[str, float],
 def coarse_grain_trajectory(parser: LammpsDumpReader,
                             timestep_index: int = -1,
                             cg_config: Optional[Dict[str, Any]] = None
-                            ) -> Tuple[Optional[List[Dict]], Optional[List[float]]]:
-    """灵活模式粗粒化 — 1:1 port from legacy 02-."""
+                            ) -> Tuple[Optional[List[Dict]], Optional[List[float]], List[str]]:
+    """灵活模式粗粒化。
+
+    返回 ``(coarse_particles, box_vector, warnings)``。``warnings`` 收集
+    id_pattern 匹配失败等非致命问题，由上层汇总打印。
+    """
+    frame_warnings: List[str] = []
     if cg_config is None:
         cg_config = {
             "method": "flexible_pattern",
@@ -80,12 +126,12 @@ def coarse_grain_trajectory(parser: LammpsDumpReader,
         }
 
     if not parser.atoms_data:
-        return None, None
+        return None, None, frame_warnings
 
     if timestep_index < 0:
         timestep_index = len(parser.timesteps) + timestep_index
     if timestep_index >= len(parser.timesteps):
-        return None, None
+        return None, None, frame_warnings
 
     atoms = parser.atoms_data[timestep_index]
     box_bounds = parser.box_bounds[timestep_index]
@@ -103,8 +149,25 @@ def coarse_grain_trajectory(parser: LammpsDumpReader,
     has_unwrapped = all(col in df.columns for col in ['xu', 'yu', 'zu'])
     cg_assignments = cg_config.get("cg_assignments", [])
 
+    # 新参数：PBC 链式 unwrap、r_cutoff、id_patterns
+    unwrap_pbc = cg_config.get("unwrap_pbc", False)
+    r_cutoff = cg_config.get("r_cutoff", None)
+    id_patterns = cg_config.get("id_patterns", []) or []
+
     if use_unwrapped and not has_unwrapped:
         use_unwrapped = False
+
+    # 链式 unwrap：把 wrapped 坐标重建为物理连续坐标（覆写 x/y/z 与 xu/yu/zu）
+    if unwrap_pbc:
+        df = _unwrap_chain_coords(df, box_bounds)
+        # unwrap 后 use_unwrapped 应为 True，让 calculate_distance / get_position
+        # 走 xu/yu/zu 路径（值已被同步为 unwrap）
+        use_unwrapped = True
+        has_unwrapped = True
+        # 强制 df 含 xu/yu/zu 列
+        for ucol, col in (('xu', 'x'), ('yu', 'y'), ('zu', 'z')):
+            if ucol not in df.columns and col in df.columns:
+                df[ucol] = df[col]
 
     coarse_particles: List[Dict[str, Any]] = []
     cg_id = 1
@@ -158,7 +221,7 @@ def coarse_grain_trajectory(parser: LammpsDumpReader,
             'atom_indices': list(atom_rows.index),
         }
 
-    # Step 1: manual assignments
+    # Step 1: manual assignments (highest priority)
     for assignment in cg_assignments:
         atom_ids = assignment.get("atom_ids", [])
         assigned_cg_type = assignment.get("cg_type", 1)
@@ -178,11 +241,92 @@ def coarse_grain_trajectory(parser: LammpsDumpReader,
         particle = create_cg_particle(target_atoms, assigned_cg_type)
         particle['manual_assignment'] = True
         particle['assigned_atom_ids'] = atom_ids
+        particle['match_status'] = 'manual'
         coarse_particles.append(particle)
         used_atom_indices.update(target_atoms.index)
         cg_id += 1
 
-    # Step 2: pattern-based for remaining atoms
+    # Step 1.5: id_patterns (id-offset based binding)
+    # 优先级介于 cg_assignments 与 patterns 之间；匹配失败的中心原子留给
+    # 后续 patterns 兜底（不占用 center_row），仅记录 warning。
+    if id_patterns and 'id' in df.columns:
+        id_to_idx = {int(v): i for i, v in enumerate(df['id'].astype(int).values)}
+        for idp in id_patterns:
+            type_pattern = idp.get("type_pattern", []) or []
+            id_offsets = idp.get("id_offsets", []) or []
+            assigned_cg_type = idp.get("cg_type", 1)
+
+            # 完整性校验
+            if len(type_pattern) < 2 or len(type_pattern) != len(id_offsets):
+                frame_warnings.append(
+                    f"id_pattern 跳过：type_pattern 与 id_offsets 长度不一致或过短: {idp}")
+                continue
+            if id_offsets[0] != 0:
+                frame_warnings.append(
+                    f"id_pattern 跳过：中心偏移必须为 0， got id_offsets={id_offsets}")
+                continue
+            if type_pattern[0] != center_type:
+                # 不是当前 center_type 的规则，跳过（不算错误）
+                continue
+
+            sub_offsets = id_offsets[1:]
+            sub_types = type_pattern[1:]
+
+            # 候选中心原子：当前类型 + 未被占用
+            center_candidates = df[
+                (df['type'] == center_type)
+                & (~df.index.isin(used_atom_indices))
+            ]
+
+            for _, center_row in center_candidates.iterrows():
+                if center_row.name in used_atom_indices:
+                    continue
+                center_id = int(center_row['id'])
+
+                sub_indices: List[int] = []
+                match_ok = True
+                for off, exp_type in zip(sub_offsets, sub_types):
+                    target_id = center_id + off
+                    if target_id not in id_to_idx:
+                        frame_warnings.append(
+                            f"id_pattern: 中心 id={center_id} 缺 id={target_id} (offset={off})")
+                        match_ok = False
+                        break
+                    target_idx = id_to_idx[target_id]
+                    target_type = int(df.loc[target_idx, 'type'])
+                    if target_type != exp_type:
+                        frame_warnings.append(
+                            f"id_pattern: 中心 id={center_id}, id={target_id} "
+                            f"type={target_type} != 期望 {exp_type}")
+                        match_ok = False
+                        break
+                    if target_idx in used_atom_indices:
+                        frame_warnings.append(
+                            f"id_pattern: 中心 id={center_id}, id={target_id} 已被占用")
+                        match_ok = False
+                        break
+                    sub_indices.append(target_idx)
+
+                if not match_ok:
+                    # 不占用中心原子，留给 patterns 兜底
+                    continue
+
+                selected_indices = [center_row.name] + sub_indices
+                atom_rows = df.loc[selected_indices]
+                particle = create_cg_particle(atom_rows, assigned_cg_type)
+                particle['manual_assignment'] = False
+                particle['match_status'] = 'id_pattern'
+                particle['id_pattern'] = {
+                    'type_pattern': list(type_pattern),
+                    'id_offsets': list(id_offsets),
+                }
+                coarse_particles.append(particle)
+                used_atom_indices.update(atom_rows.index)
+                cg_id += 1
+    elif id_patterns and 'id' not in df.columns:
+        frame_warnings.append("id_pattern 跳过：原子 dump 无 id 列")
+
+    # Step 2: pattern-based (distance) for remaining atoms
     pattern_to_cg_type: Dict[Tuple[int, ...], int] = {}
     cg_type_counter = 1
     for pattern in patterns:
@@ -195,7 +339,9 @@ def coarse_grain_trajectory(parser: LammpsDumpReader,
     center_atoms = available_df[available_df['type'] == center_type]
 
     if len(center_atoms) == 0 and len(coarse_particles) == 0:
-        return [], box_vector
+        return [], box_vector, frame_warnings
+
+    cutoff_sq = float(r_cutoff) ** 2 if r_cutoff is not None else None
 
     for _, center_row in center_atoms.iterrows():
         if center_row.name in used_atom_indices:
@@ -226,6 +372,10 @@ def coarse_grain_trajectory(parser: LammpsDumpReader,
                 dist_sq = calculate_distance(center_pos, type2_pos, box_bounds, use_unwrapped)
                 distances.append((dist_sq, idx))
 
+            # r_cutoff 过滤：仅保留截止半径内的候选
+            if cutoff_sq is not None:
+                distances = [t for t in distances if t[0] <= cutoff_sq]
+
             if len(distances) < n_neighbor_type2:
                 continue
 
@@ -240,33 +390,45 @@ def coarse_grain_trajectory(parser: LammpsDumpReader,
                 best_match_atoms = selected_atom_rows
 
         if best_match_atoms is None:
+            # 所有 pattern 都因 r_cutoff 不足或候选不够而失败
+            frame_warnings.append(
+                f"中心原子 id={int(center_row.get('id', -1))} 无匹配 pattern "
+                f"(r_cutoff={r_cutoff})")
             continue
 
         pattern_tuple = tuple(best_pattern)
         cg_type = pattern_to_cg_type.get(pattern_tuple, 1)
         particle = create_cg_particle(best_match_atoms, cg_type)
         particle['pattern'] = best_pattern
+        particle['manual_assignment'] = False
+        particle['match_status'] = 'pattern'
         coarse_particles.append(particle)
         used_atom_indices.update(best_match_atoms.index)
         cg_id += 1
 
-    return coarse_particles, box_vector
+    return coarse_particles, box_vector, frame_warnings
 
 
 def process_all_timesteps(parser: LammpsDumpReader,
                           cg_config: Optional[Dict[str, Any]] = None
-                          ) -> Tuple[List[Dict], np.ndarray]:
-    """处理所有时间步 — 1:1 port."""
+                          ) -> Tuple[List[Dict], np.ndarray, List[str]]:
+    """处理所有时间步。
+
+    返回 ``(all_coarse_data, all_box_vectors, all_warnings)``。
+    """
     all_coarse_data: List[Dict[str, Any]] = []
     all_box_vectors: List[List[float]] = []
+    all_warnings: List[str] = []
     for timestep_idx in range(len(parser.timesteps)):
-        coarse_particles, box_vector = coarse_grain_trajectory(parser, timestep_idx, cg_config)
+        coarse_particles, box_vector, frame_warnings = coarse_grain_trajectory(
+            parser, timestep_idx, cg_config)
         if coarse_particles is not None:
             for particle in coarse_particles:
                 particle['timestep'] = parser.timesteps[timestep_idx]
             all_coarse_data.extend(coarse_particles)
             all_box_vectors.append(box_vector)
-    return all_coarse_data, np.array(all_box_vectors)
+        all_warnings.extend(frame_warnings)
+    return all_coarse_data, np.array(all_box_vectors), all_warnings
 
 
 # =============================================================================
@@ -355,11 +517,11 @@ def export_cg_trajectory(parser: LammpsDumpReader,
 def traj2CG(filename: str, out_dir: str,
             cg_config: Dict[str, Any],
             output_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Process a single trajectory file — 1:1 port."""
+    """Process a single trajectory file."""
     parser = LammpsDumpReader(filename)
     if not parser.parse_file(verbose=False):
         raise Exception("File parsing failed!")
-    all_coarse_data, all_box_vectors = process_all_timesteps(parser, cg_config)
+    all_coarse_data, all_box_vectors, all_warnings = process_all_timesteps(parser, cg_config)
     coarse_df = pd.DataFrame(all_coarse_data)
 
     output_prefix = os.path.join(out_dir, os.path.basename(filename))
@@ -376,18 +538,24 @@ def traj2CG(filename: str, out_dir: str,
     return {
         'timesteps': len(all_box_vectors),
         'particles': len(coarse_df),
+        'warnings': all_warnings,
     }
 
 
 def _process_one_case(task: Tuple[str, str, Dict[str, Any], Dict[str, Any]]
-                      ) -> Tuple[str, bool, str, Dict[str, Any]]:
-    """Top-level worker for ProcessPoolExecutor (must be picklable)."""
+                      ) -> Tuple[bool, str, Dict[str, Any]]:
+    """Top-level worker for ProcessPoolExecutor (must be picklable).
+
+    Returns the ``run_parallel`` 3-tuple ``(ok, msg, stats)`` — the task
+    payload itself is prepended by the caller, so we must NOT include
+    ``in_file`` here (doing so caused a tuple-unpacking cascade).
+    """
     in_file, out_dir, cg_config, output_config = task
     try:
         stats = traj2CG(in_file, out_dir, cg_config, output_config)
-        return in_file, True, '', stats
+        return True, '', stats
     except Exception as exc:  # noqa: BLE001
-        return in_file, False, str(exc), {}
+        return False, str(exc), {}
 
 
 # =============================================================================
@@ -407,21 +575,29 @@ def process_simulation(sim_config: Dict[str, Any],
         'success': 0, 'failed': 0,
         'total_timesteps': 0, 'total_particles': 0,
         'errors': [],
+        'warnings': [],
     }
     if not stats['enabled']:
         return stats
 
-    traj_dir = os.path.join(paths_config['base_dir'], sim_config['trajectory_dir'])
-    if not os.path.exists(traj_dir):
-        stats['errors'].append(f"Trajectory directory does not exist: {traj_dir}")
-        return stats
+    traj_dir_template = os.path.join(paths_config['base_dir'], sim_config['trajectory_dir'])
 
     filter_config = processing_config.get('trajectory_filter', {}) or {}
     temperatures = sim_config.get('temperatures') or [None]
 
     for temp in temperatures:
         temp_str = f"{temp}K" if temp is not None else "N/A"
-        files = glob_with_temp(traj_dir, sim_config['file_pattern'], temp)
+        # Substitute {temp} into both the directory and the glob pattern, so
+        # layouts like "<sim>/<temp>/traj/" with per-temp subdirectories work.
+        # (Existence check is done per-temp inside the loop; an early exit on
+        # a literal "{temp}" template used to silently skip such sims.)
+        traj_dir = _paths.substitute_temp(traj_dir_template, temp)
+        if not os.path.exists(traj_dir):
+            stats['errors'].append(
+                f"Trajectory directory does not exist for {sim_config['name']} "
+                f"{temp_str}: {traj_dir}")
+            continue
+        files = glob_with_temp(traj_dir_template, sim_config['file_pattern'], temp)
         if not files:
             continue
 
@@ -450,13 +626,20 @@ def process_simulation(sim_config: Dict[str, Any],
             n_workers=max_workers, parallel=parallel,
             desc=f"  {sim_config['name']} {temp_str}", unit="file",
         )
-        for in_file, ok, msg, file_stats in results:
+        for task, ok, msg, file_stats in results:
             if ok:
                 stats['success'] += 1
                 stats['total_timesteps'] += file_stats.get('timesteps', 0)
                 stats['total_particles'] += file_stats.get('particles', 0)
+                file_warnings = file_stats.get('warnings') or []
+                if file_warnings:
+                    in_file = task[0]
+                    basename = os.path.basename(in_file)
+                    for w in file_warnings:
+                        stats['warnings'].append(f"{basename}: {w}")
             else:
                 stats['failed'] += 1
+                in_file = task[0]  # task = (in_file, out_dir, cg_config, output_config)
                 stats['errors'].append(f"{os.path.basename(in_file)}: {msg}")
 
     return stats
@@ -473,10 +656,26 @@ def run(config: Dict[str, Any], args: argparse.Namespace) -> int:
     output_config = config.get('output', {})
     processing_config = config.get('processing', {})
 
+    # CLI overrides for new algorithm knobs
+    if hasattr(args, 'r_cutoff') and args.r_cutoff is not None:
+        cg_config['r_cutoff'] = args.r_cutoff
+    if hasattr(args, 'unwrap_pbc') and args.unwrap_pbc is not None:
+        cg_config['unwrap_pbc'] = args.unwrap_pbc
+
     print(f"\n{'=' * 60}")
     print("COARSE-GRAINING DATA PROCESSING")
     print(f"{'=' * 60}")
     print(f"CG Method: {cg_config['method']}")
+    print(f"PBC chain unwrap: {cg_config.get('unwrap_pbc', False)}")
+    print(f"r_cutoff (pattern distance): {cg_config.get('r_cutoff', None)}")
+    if cg_config.get('id_patterns'):
+        print(f"id_patterns: {len(cg_config['id_patterns'])} rule(s)")
+        for idp in cg_config['id_patterns']:
+            desc = idp.get('description', '')
+            print(f"  type_pattern={idp.get('type_pattern')} "
+                  f"id_offsets={idp.get('id_offsets')} "
+                  f"cg_type={idp.get('cg_type', 1)}"
+                  + (f" ({desc})" if desc else ""))
     if cg_config['method'] == 'flexible_pattern':
         patterns = cg_config.get('patterns', [])
         pattern_to_type: Dict[Tuple[int, ...], int] = {}
@@ -525,6 +724,28 @@ def run(config: Dict[str, Any], args: argparse.Namespace) -> int:
                 print(f"    {err}")
             if len(s['errors']) > 5:
                 print(f"    ... and {len(s['errors']) - 5} more")
+
+    # Warnings aggregation (dedupe by message template, count occurrences)
+    all_warnings: List[str] = []
+    for s in all_stats:
+        all_warnings.extend(s.get('warnings', []))
+    if all_warnings:
+        # Group by warning message (strip leading "filename: " for dedup)
+        from collections import OrderedDict
+        grouped: 'OrderedDict[str, List[str]]' = OrderedDict()
+        for w in all_warnings:
+            if ': ' in w:
+                prefix, msg = w.split(': ', 1)
+            else:
+                prefix, msg = '', w
+            grouped.setdefault(msg, []).append(prefix)
+        print(f"\nWARNINGS ({len(all_warnings)} total, {len(grouped)} unique):")
+        for msg, files in list(grouped.items())[:20]:
+            sample = files[0]
+            extra = f" (+{len(files) - 1} more files)" if len(files) > 1 else ""
+            print(f"  [{sample}{extra}] {msg}")
+        if len(grouped) > 20:
+            print(f"  ... and {len(grouped) - 20} more unique warning types")
 
     total_failed = sum(s['failed'] for s in all_stats)
     return 0 if total_failed == 0 else 1

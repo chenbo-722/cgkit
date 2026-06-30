@@ -19,4 +19,6 @@ __all__ = [
     "analyze_cg",
     "analyze_atomic",
     "pt_plot",
+    "select_structures",
+    "cg_verify",
 ]

@@ -24,7 +24,7 @@ from typing import Optional
 # Top-level: CLI + domain modules that need only numpy/pandas/tqdm.
 from cglib.cli import build_parser
 from cglib.config import load_config, merge_config_with_args, default_config_path
-from cglib import cg_gen, deepmd_conv, fparam, analyze_cg, pt_plot
+from cglib import cg_gen, deepmd_conv, fparam, analyze_cg, pt_plot, select_structures, cg_verify
 
 
 # =============================================================================
@@ -43,12 +43,14 @@ def _run_analyze_atomic(config, args) -> int:
 
 # Each entry: (handler_callable, requires_fparam_mode).
 DISPATCH = {
-    "cg-gen":          (cg_gen.run,           False),
-    "to-deepmd":       (deepmd_conv.run,      False),
-    "fparam":          (fparam.run,           True),
-    "analyze-cg":      (analyze_cg.run,       False),
-    "analyze-atomic":  (_run_analyze_atomic,  False),
-    "plot-pt":         (pt_plot.run,          False),
+    "cg-gen":            (cg_gen.run,            False),
+    "to-deepmd":         (deepmd_conv.run,       False),
+    "fparam":            (fparam.run,            True),
+    "analyze-cg":        (analyze_cg.run,        False),
+    "analyze-atomic":    (_run_analyze_atomic,   False),
+    "plot-pt":           (pt_plot.run,           False),
+    "select-structures": (select_structures.run, False),
+    "cg-verify":         (cg_verify.run,         False),
 }
 
 

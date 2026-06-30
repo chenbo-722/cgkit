@@ -10,6 +10,7 @@
 4. **统计与结构分析**：对粗粒化数据集进行能量分布、粒子数统计、时间序列分析。
 5. **高维结构表征**：基于 SOAP 描述符 → PCA → t-SNE → 聚类（DBSCAN/KMeans）的完整降维与聚类流程，支持可选的 PyTorch GNN 图嵌入分析。
 6. **P–T 空间覆盖**：将每个原子级 dump 帧的 timestep 关联至 `log.lammps` 的 thermo 行，输出 P–T 散点图与 `pt_data.csv`，便于评估训练集的温度/压力覆盖度。
+7. **结构筛选**：消费 `analyze-atomic` 的 PCA/t-SNE 结果，在其投影空间上聚类，对每个类用 maximin（最远点采样）选 N 个最具多样性的构型，并把选中帧从源 dump 抽取成独立 LAMMPS dump 文件复制到指定目录，用于构造代表性训练子集。
 
 **设计优势**：
 - 统一入口（`cgkit.py`）替代原先 5 个独立脚本（约 5,200 行），保留原始算法 1:1 还原。
@@ -67,6 +68,7 @@ pip install numpy pandas tqdm
 | `analyze-atomic` | `matplotlib`, `scipy`, `scikit-learn`；`networkx`（可选） |
 | `analyze-atomic`（SOAP 描述符） | 额外需要 `ase`, `dscribe` |
 | `analyze-atomic`（GNN 嵌入） | 额外需要 `torch`, `torch-geometric`（缺失时自动回退到随机嵌入） |
+| `analyze-atomic`（UMAP 降维） | 额外需要 `umap-learn>=0.5`（缺失时自动跳过 UMAP 步骤，不影响 PCA/t-SNE/聚类） |
 
 ---
 
@@ -110,7 +112,9 @@ cgkit analyze-atomic --mode cg --max-frames 500
   - `--sim NAME [NAME...]`：筛选模拟（如 `1-npt`, `2-nvt`）
   - `--temp K [K...]`：覆盖温度列表
   - `--workers N`：并行进程数
-- **输出**：每个轨迹生成 `<basename>_particles.csv`, `<basename>_box_vectors.csv`，可选 `<basename>_cg.lammpstrj`
+  - `--r-cutoff Å`：pattern 距离匹配截断半径（默认 1.25；`null` 表示不限）
+  - `--unwrap-pbc` / `--no-unwrap-pbc`：开/关 cg-gen 前的链式 PBC unwrap 预处理
+- **输出**：每个轨迹生成 `<basename>_particles.csv`, `<basename>_box_vectors.csv`，可选 `<basename>_cg.lammpstrj`。`_particles.csv` 自升级后多出 `match_status`（`manual` / `id_pattern` / `pattern`）与 `id_pattern`（命中的规则序列化）两列，便于溯源每个 bead 的来源阶段。
 
 #### 4.1.1 粗粒化映射原理与规则
 
@@ -388,20 +392,37 @@ return dx*dx + dy*dy + dz*dz
 
 ### 4.6 `cgkit analyze-atomic` — 原子/粗粒化结构分析
 
-- **功能**：SOAP 描述符 → PCA → t-SNE → 聚类（DBSCAN/KMeans）全流程；支持可选的 PyTorch GNN 图嵌入与网络拓扑可视化。
+- **功能**：SOAP 描述符 → PCA → t-SNE → **UMAP** → 聚类（DBSCAN/KMeans）全流程；支持可选的 PyTorch GNN 图嵌入与网络拓扑可视化。UMAP 为可选步骤（需 `pip install -e ".[umap]"`），`umap-learn` 缺失时自动跳过 UMAP，不影响其余步骤。
 - **对应旧脚本**：`0x-analyze_atomic_structure.py`
 - **配置节**：`analysis_atomic.*`, `paths.{cg,aa}_data_base_dir`, `simulations`
+  - `analysis_atomic.umap`：UMAP 超参，键 `n_components`（默认 5，面向聚类；可视化只画前 2 维）、`n_neighbors`（15）、`min_dist`（0.1）、`metric`（`'euclidean'`）。
+  - `analysis_atomic.clustering.space`：决定聚类读取的投影空间，取值 `pca` / `tsne` / `umap`，默认 `pca`（与升级前一致）。若所选空间的对应结果不可用（例如设了 `umap` 但 `umap-learn` 未装），会打印警告并自动回退到 PCA。
 - **模式**：
   - `--mode cg`：分析粗粒化轨迹（读取 `*_cg.lammpstrj`）
   - `--mode aa`：分析全原子轨迹
 - **常用 CLI 参数**：
   - `--max-frames N`：限制总帧数
   - `--max-per-file N`：限制每个轨迹文件的帧数（CG 模式）
+  - `--cluster-space {pca,tsne,umap}`：覆盖 `analysis_atomic.clustering.space`；`tsne`/`umap` 在对应结果缺失时回退到 `pca`。
 - **输出**：
-  - `pca_results.csv`, `tsne_results.csv`, `descriptors.csv`
+  - `pca_results.csv`, `tsne_results.csv`, `umap_results.csv`, `descriptors.csv`（UMAP 列为 `UMAP1..UMAPn`，`n = analysis_atomic.umap.n_components`）
   - `outlier_structures.csv`
-  - `figures/` 目录下的 PNG 可视化图
-  - 自 v2 起，上述 CSV 末尾统一附带溯源列 `structure_id, source_file, temp`，其中 `structure_id` 形如 `<sim>/<temp|ramp>@<timestep>`，便于从 PCA/t-SNE/聚类空间的点回到原始 dump 帧。
+  - `figures/` 目录下的 PNG 可视化图（含 `umap_overall.png` / `umap_<sim>.png`；UMAP 被跳过时不生成）
+  - CG 模式下，以上文件统一加 `CG_` 前缀（例如 `CG_umap_results.csv`）。
+  - 自 v2 起，上述 CSV 末尾统一附带溯源列 `structure_id, source_file, temp`，其中 `structure_id` 形如 `<sim>/<temp|ramp>@<timestep>`，便于从 PCA/t-SNE/UMAP/聚类空间的点回到原始 dump 帧。
+
+#### 4.6.1 降维方法对比与聚类空间选择
+
+| 方法 | 类型 | 保留结构 | 计算成本 | 默认维度 | 推荐用途 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **PCA**    | 线性   | 全局（方差最大）         | 低（一次 SVD）              | 10（取前 3 维聚类） | 基线、快速、可解释；默认聚类空间 |
+| **t-SNE**  | 非线性 | 局部（邻域结构）         | 中（`O(N log N)` 量级）     | 2（仅可视化）       | 二维可视化、发现聚类簇 |
+| **UMAP**   | 非线性 | 局部 + 较好保留全局      | 中高（首次建图较慢）        | 5（兼顾聚类+可视化） | 既可用于聚类，又可用于可视化； manifold 假设更强 |
+
+- **何时切换 `clustering.space`**：默认在 PCA 前 3 维上聚类。若 SOAP 描述符高度非线性（典型情形：高温/低温/ramping 跨态样本混合），把 `analysis_atomic.clustering.space` 改为 `umap`（或 CLI 加 `--cluster-space umap`）通常能得到更紧致的簇。t-SNE 的 2 维投影波动较大，**不推荐**用作正式聚类空间，主要留给可视化。
+- **UMAP 缺失时的降级**：`HAS_UMAP=False` 时整条流水线照常运行 —— UMAP 步骤、`umap_*.png` 绘图、`umap_results.csv` 写盘均被跳过；若此时 `clustering.space='umap'`，聚类器会打印 `Warning: clustering.space='umap' but no ... UMAP result; falling back to PCA.` 并改用 PCA。
+- **复现性**：PCA 与 UMAP 均受 `random_state=42` 控制（UMAP 内部用 `numpy.random.seed`）；t-SNE 也固定 `random_state=42`。同一份描述符跨机器结果一致。
+- **`select-structures` 联动**：`umap_results.csv` 可直接喂给 `cgkit select-structures`（`--space umap` 或按列名 `UMAP1..n` 自动识别）。当 CSV 同时含 `PC*`/`UMAP*`/`tSNE*` 列时，自动检测优先级为 PCA > UMAP > t-SNE。
 
 ### 4.7 `cgkit plot-pt` — P–T 空间覆盖图
 
@@ -419,11 +440,345 @@ return dx*dx + dy*dy + dz*dz
   - `figures/pt_overview.png`：单张 P-vs-T 散点（Arial、183 mm 双栏宽、红蓝 categorical 配色、无 spine/网格）
 - **典型用途**：在拟合 CG 势能前快速检查 (P, T) 空间的覆盖空白；`temp_measured` 与 `pressure` 为 `NaN` 表示该帧 timestep 未在 log 中命中，会在终端打印 `[skip-log]` / `[no-match]` 计数。
 
+### 4.8 `cgkit select-structures` — 基于聚类的结构筛选
+
+- **功能**：消费 `cgkit analyze-atomic` 产出的 `pca_results.csv` / `tsne_results.csv` / `umap_results.csv`（含 `PC1..PC10` / `tSNE1,tSNE2` / `UMAP1..UMAPn` 坐标 + `structure_id, source_file, temp, timestep`），在所选投影空间上重新聚类（KMeans / DBSCAN，参数可调），对每个类用 **maximin（最远点贪心采样）** 选 N 个最具多样性的构型，并把每个被选中的帧从源 dump 文件抽取成独立的 LAMMPS dump 文件复制到指定输出目录。用于从大轨迹库里挑出代表性、覆盖度高的训练子集。
+- **对应模块**：`cglib/select_structures.py`（新增）
+- **配置节**：`select_structures.{input, output_dir, method, space, n_clusters, min_samples, include_noise, seed}`
+- **前置工作流**：先 `cgkit analyze-atomic`（产出 CSV），再 `cgkit select-structures`。这样筛选参数（聚类数、N 等）可反复试，无需重跑昂贵的 SOAP/PCA/t-SNE/UMAP 流程。
+- **常用 CLI 参数**：
+  - `--input FILE`：输入 CSV（`pca_results.csv` / `tsne_results.csv` / `umap_results.csv` / CG 版本，来自 `analyze-atomic`）
+  - `--output-dir DIR`：输出目录（选中帧 dump + manifest）
+  - `--n N`（必填）：每个类选 N 个构型
+  - `--space {pca,tsne,umap}`：投影空间（省略则按列名 `PC1` / `UMAP1` / `tSNE1` 自动检测；同时存在多类列时优先级 PCA > UMAP > t-SNE）
+  - `--method {kmeans,dbscan}`：聚类算法（默认 `kmeans`）
+  - `--n-clusters K`：KMeans 簇数（默认 8；自动 cap 到 `len(X)//2`）
+  - `--eps FLOAT`：DBSCAN 邻域半径（省略则取成对距离 30 百分位）
+  - `--min-samples N`：DBSCAN 核心点最小邻居数（默认 5）
+  - `--include-noise`：把 DBSCAN 噪声点（label -1）当作可采样簇（默认跳过）
+  - `--seed N`：KMeans 随机种子（默认 42）
+
+- **maximin 选择算法**：每个簇内，第一个选中点是离簇质心最近的点（确定性，无需 RNG）；之后每一步选使「到已选点集的最小距离」最大的未选点（经典最远点采样 / FPS）。这样保证选出的 N 个构型在投影空间里彼此尽量分散，最大化结构覆盖度。簇内点数 < N 时全选，并打印 `[small-cluster]` 告警。
+
+- **帧抽取规则**：按 `source_file` 分组选中行，每个源 dump 至多解析一次；用 `timestep` 列（缺失时从 `structure_id` 末段 `@<ts>` 解析，适配 CG CSV）定位帧，调用 `cglib.lammps.write_lammps_frame` 写成单帧 dump。timestep 未命中则打印 `[no-frame]` 跳过。
+
+- **输出**（位于 `<output_dir>/`）：
+  - 每个选中帧一个 `.lammpstrj`：文件名 = `structure_id` 净化后（`/`、`@` → `_`），如 `1-npt_200_100000.lammpstrj`，含该 timestep 的 `id type xu yu zu c_pe fx fy fz`（与原 dump 同列）。
+  - `selection_manifest.csv`：列为 `structure_id, cluster, selection_rank, source_file, timestep, temp, <PC1..PCk 或 tSNE1..tSNEk>, output_file`，记录全部选择结果便于溯源。
+
+- **典型用法**：
+  ```bash
+  # 先跑分析（一次性产出 pca_results.csv）
+  cgkit analyze-atomic --mode aa --max-frames 2000
+
+  # 反复试不同聚类参数，无需重跑分析
+  cgkit select-structures --input pca_results.csv --output-dir sel_k8n3 \
+      --n 3 --method kmeans --n-clusters 8
+  cgkit select-structures --input pca_results.csv --output-dir sel_tsne \
+      --n 5 --space tsne        # 自动用 tSNE 列聚类
+  ```
+
+- **边界情况**：DBSCAN 把全部点判为噪声且未加 `--include-noise` 时报错退出；CG CSV 无 `timestep` 列时从 `structure_id` 解析；源 dump 找不到对应 timestep 时该行 `output_file` 留空并告警。
+
+---
+
+### 4.9 `cgkit cg-verify` — 粗粒化结果校核
+
+- **功能**：把 CG 粒子 CSV（`*_particles.csv`）与对应的源原子 LAMMPS dump 逐帧比对，自动揪出粗粒化过程中的常见 bug，尤其是「使用 wrapped 坐标做最近邻匹配，导致同一 CG 粒子的成员原子横跨周期边界」这类隐蔽错误。
+
+- **对应模块**：`cglib/cg_verify.py`（新增）
+
+- **两种模式**：
+
+  - **`--mode auto`（默认）**：对每个 CG CSV 跑 4 项检查
+    1. **`pbc`（跨周期边界检测）**：对每个非手工分配的 CG 粒子，计算其成员原子在 x/y/z 三轴上的坐标跨度（最大值 - 最小值），除以盒子边长得到分数；超过 `--pbc-thresh`（默认 0.45，即 45%）报 FAIL，超过一半（22.5%）报 WARN。手工分配（`manual_assignment=True`）的粒子允许故意跨界，跳过。
+    2. **`conservation`（守恒量重算）**：精确镜像 `cg_gen.create_cg_particle` 的算法 —— 位置取中心原子（`atom_indices` 首个索引）、力/PE 在 `average_*` 开启时取成员均值 —— 用原子数据重算后与 CSV 存储值对比。容差：力 `--force-tol`（默认 `1e-4` eV/Å），PE `--pe-tol`（默认 `1e-6` eV），位置必须严格相等（误差 > `1e-9` 即 FAIL）。
+    3. **`coverage`（原子覆盖性）**：每个原子行索引必须**恰好**出现在一个 CG 粒子的 `atom_indices` 里。遗漏或重复都报 FAIL。
+    4. **`manual`（手工分配保真）**：config 的 `coarse_graining.cg_assignments` 每一条都必须对应 CSV 里**恰好一行** `manual_assignment=True`、`assigned_atom_ids` 匹配、CG type 匹配的记录；缺失/重复/类型不符都报 FAIL，CSV 里多出来的未声明手工分配报 WARN。
+
+  - **`--mode manual --atoms ID1 ID2 ...`**：对每个用户指定的原子 ID，报告它属于哪个 CG 粒子、同粒子的兄弟原子 ID、CG 位置、该原子自己的位置、以及 quick PBC 跨界标志。用于追踪 `--mode auto` 报出的具体原子。
+
+- **文件发现**：
+  - 默认：扫描 `paths.cg_data_base_dir/<sim>/` 下排序后的第一个 `*_particles.csv`（先经 `--sim`/`--temp` 过滤）
+  - `--all`：扫描所有 enabled sim 的全部文件
+  - `--file PATH`：显式指定单文件（与 `--all` 互斥）
+  - `--max-files N`：给 `--all` 加上限
+
+- **原子源解析**：从 CG 文件名剥掉 `_particles.csv` 后缀（如 `foo.lammpstrj_particles.csv` → `foo.lammpstrj`），在 `paths.aa_data_base_dir`（可用 `--atomic-dir` 覆盖）下按 sim 的 `trajectory_dir`/`data_subdir`/`output_subdir` 逐级查找；都找不到则递归兜底。
+
+- **配置节**：`verify_cg.{output_dir, checks, force_tolerance, pe_tolerance, pbc_span_threshold}`、`paths.{cg,aa}_data_base_dir`、`coarse_graining.{position_source, average_forces, average_potential_energy, cg_assignments}`、`simulations`。
+
+- **常用 CLI 参数**：
+  - `--mode {auto,manual}`：auto = 全套 4 项检查（默认）；manual = 查询 `--atoms` 列表
+  - `--atoms ID [ID...]`：要查询的原子 ID（仅 manual 模式有效）
+  - `--file PATH | --all`：单文件（互斥）| 全量扫描
+  - `--max-files N`：限制 `--all` 的扫描文件数
+  - `--base-dir DIR`：覆盖 `paths.cg_data_base_dir`（CG CSV 根）
+  - `--atomic-dir DIR`：覆盖 `paths.aa_data_base_dir`（原子 dump 根）
+  - `--output-dir DIR`：报告 CSV 输出目录
+  - `--checks pbc conservation coverage manual`：选子集（默认全选）
+  - `--force-tol TOL`：力重算容差，eV/Å（默认 `1e-4`）
+  - `--pe-tol TOL`：PE 重算容差，eV（默认 `1e-6`）
+  - `--pbc-thresh FRAC`：PBC 跨界 FAIL 阈值，盒子长度分数（默认 `0.45`）
+  - `--no-csv`：不写 `cg_verify_report.csv`
+  - `--failures-only`：CSV 只写 FAIL 行
+  - `--quiet` / `-q`：只在该文件有 FAIL 时才打印详细信息
+  - `--sim` / `--temp` / `--workers`：通用过滤/并行参数
+
+- **输出**：
+  - **stdout**：逐文件人类可读报告（逐帧 FAIL/WARN 计数、最大重算误差）+ 最终汇总。
+  - **`<output_dir>/cg_verify_report.csv`**（仅在有问题时生成）：每行一个 issue，列为 `file, sim, temp, timestep, check, severity, cg_id, message, n_atoms, member_atom_ids, force_err, pe_err, pos_err, pbc_span_frac_{x,y,z}`。
+
+- **退出码**：
+  - `0`：全部通过（允许 WARN）
+  - `1`：至少一个 FAIL
+  - `2`：文件级错误（原子源缺失 / 解析失败 / timestep 不匹配），无法完成校核
+  - `3`：CLI 用法错误（如 `--mode manual` 忘带 `--atoms`）
+
+- **典型用法**：
+  ```bash
+  # 默认单文件 auto 模式（拿第一个 CSV 试水）
+  cgkit cg-verify
+
+  # 指定原子源目录（CG 来自选择性采样时常用）
+  cgkit cg-verify --atomic-dir /path/to/slim_atomic_data
+
+  # 全量扫描 + 限制 20 个文件 + 静默
+  cgkit cg-verify --all --max-files 20 --quiet
+
+  # 只跑 PBC 检查、收紧阈值到 30%
+  cgkit cg-verify --checks pbc --pbc-thresh 0.30
+
+  # 手动查询 config.cg_assignments 里的 8 个原子
+  cgkit cg-verify --mode manual --atoms 1 67 68 69 66 197 198 199
+
+  # 显式指定文件 + 只输出 FAIL 到 CSV
+  cgkit cg-verify --file /path/to/foo_particles.csv --failures-only
+  ```
+
+- **边界情况**：
+  - 原子文件缺失 → worker 返 `(False, "atomic source not found", {})`，退出码 2
+  - 三斜盒（tilt 非零）→ 当前 `LammpsDumpReader` 会丢弃 tilt；stdout 打一条 INFO 警告，检查继续
+  - `position_source="unwrapped"` 但 dump 无 `xu/yu/zu` → 复用 `cg_gen.py` 的回退逻辑（用 wrapped），stdout 打印 INFO
+  - `cg_assignments` 为空 → `verify_manual_fidelity` 返回空列表，不报错
+  - 手动模式原子 ID 不在文件 → 打印 "NOT FOUND"，继续处理其它 ID
+  - CSV 多 timestep → 按 timestep 分组，每组分别跑 4 项检查，原子文件用匹配 timestep 的 frame
+
+---
+
+### 4.10 `cg-gen` 算法升级：PBC 链式 unwrap + r_cutoff + id_pattern
+
+`cg-gen` 在原两阶段算法（`cg_assignments` → `patterns`）基础上，新增三项
+能力：周期性边界 unwrap 预处理、`r_cutoff` 距离截断、`id_patterns` 基于
+id 偏移的明确绑定。三者均为可选——不写新 config 字段时行为完全等同旧版。
+
+#### 4.10.1 三阶段优先级（升级后）
+
+```
+Step 1   cg_assignments  （显式 atom_ids，最高优先级）
+Step 1.5 id_patterns     （type_pattern + id_offsets，新增）
+Step 2   patterns        （距离最近邻，兜底）
+```
+
+任一阶段消费的原子都会从后续阶段的候选池里剔除，因此一个原子只会被一个
+bead 占有。
+
+#### 4.10.2 PBC 链式 unwrap 预处理
+
+**触发**：`coarse_graining.unwrap_pbc=true`（默认值；CLI 用 `--unwrap-pbc` /
+`--no-unwrap-pbc` 覆盖）。`unwrap_method` 当前仅支持 `"chain"`（保留为扩展位）。
+
+**算法**：对每帧原子坐标，**按 id 顺序**对每个原子相对前一个原子做最小镜像
+折叠：
+
+```python
+for i in 1..N:
+    d = coord[i] - coord[i-1]
+    coord[i] -= round(d / L) * L        # L = box length on that axis
+```
+
+折叠后的坐标写入 `x/y/z` 列并同步到 `xu/yu/zu`，后续的距离匹配、位置存储、
+CG dump 输出全部基于这些"物理实际坐标"。
+
+**物理含义**：wrapped 坐标在原子穿越周期边界时会发生 ±L 的跳变。两条链分别
+位于盒子两端时，其 wrapped 坐标相距 ~L，但物理上可能近在咫尺。链式 unwrap
+按 id 顺序把同一条链的原子"拼回"连续轨迹，消除这种伪距。
+
+**适用前提**：链式 unwrap 假设 **id 顺序 = 化学键顺序**（即 dump 按分子 /
+链内原子顺序输出）。这是大多数 LAMMPS `write_data` 默认行为的成立条件。
+
+> ⚠ **不适用场景**：若 dump 把所有 type 1（C）列在前面、所有 type 2（H）
+> 列在后面（如本工作流 `01.aa_small` 的某些 dump），则 C→H 边界处（如
+> `id=66` 的末位 C 到 `id=67` 的首位 H）会按非化学键顺序做折叠，把 H 错误
+> 地"拉"到 C 链末端附近。这种 dump 应使用 `--no-unwrap-pbc` 关闭 unwrap，
+> 或先用 `id_patterns` 明确指定 C-H 绑定关系。
+
+#### 4.10.3 `r_cutoff` 距离截断
+
+**触发**：`coarse_graining.r_cutoff` 为数值（默认 1.25 Å；`null` 表示不限）。
+CLI 用 `--r-cutoff` 覆盖。
+
+**算法**：Step 2 (patterns) 阶段，在升序排序候选 H 之前，先剔除到中心原子
+平方距离 > `r_cutoff²` 的候选。若截断内候选数 < pattern 所需 H 数，该中心
+原子无法形成 bead，会被跳过并触发警告：
+
+```
+WARNINGS (r_cutoff):
+  中心原子 id=X 无匹配 pattern (r_cutoff=1.25)  (×N 次)
+```
+
+**用途**：当多个 C 竞争同一个 H 时，距离远的 C 不应"偷"走近邻 C 的 H。
+1.25 Å 约为 C-H 键长的 1.2 倍，足以容纳振动带来的距离浮动。
+
+#### 4.10.4 `id_patterns`（id 偏移绑定）
+
+**触发**：`coarse_graining.id_patterns` 列表非空。
+
+**格式**：
+
+```json
+"id_patterns": [
+  {
+    "type_pattern": [1, 2, 2],          // 与 patterns 同语义
+    "id_offsets":   [0, 67, 68],        // 第 i 个成员 = center_id + offset
+    "cg_type":      1,                  // 该 bead 的 CG type
+    "description":  "C + 2 H by id offset"
+  }
+]
+```
+
+**约束**：
+
+| 校验 | 失败处理 |
+| :--- | :--- |
+| `len(type_pattern) == len(id_offsets)` 且 ≥ 2 | 跳过该规则，警告 |
+| `id_offsets[0] == 0`（中心必须是自身） | 跳过该规则，警告 |
+| `type_pattern[0] == center_atom_type` | 不是当前 center_type 的规则，跳过（不警告） |
+
+**匹配流程**（对每个未被占用的中心原子）：
+
+1. 按 `center_id + id_offsets[i]` 查找每个成员原子的 id；
+2. 任一成员 id 不存在 / type 不匹配 / 已被占用 → 该中心原子跳过此规则，
+   警告消息按 `id_pattern_id_missing` / `id_pattern_type_mismatch` /
+   `id_pattern_atom_used` 分类，留给后续 patterns 阶段兜底；
+3. 全部通过 → 创建 bead，`match_status=id_pattern`，原子标记为已占用。
+
+**适用场景**：dump 的 id 编号有统一规律时（例如"每个 CH₂ 的两个 H 的 id
+正好是 C id +1, +2"），用 `id_patterns` 比依赖距离更稳健、更快（无 O(N²)
+邻居搜索）。
+
+> ⚠ **不适用场景**：若 id 编号无统一偏移规律（例如本工作流 `01.aa_small`
+> 的 PE dump：所有 C 在 id 1–66，所有 H 在 id 67–200，H 的偏移因 C 索引
+> 而异：C1→+67/+68、C2→+69/+70、…），常量偏移会大面积冲突，警告刷屏。这种
+> dump 应使用默认 `patterns`（距离匹配），不用 `id_patterns`。
+
+#### 4.10.5 `match_status` 列
+
+每个 CG bead 在 `_particles.csv` 里的 `match_status` 字段记录其来源阶段：
+
+| 值 | 来源 | 其它相关列 |
+| :--- | :--- | :--- |
+| `manual` | Step 1 `cg_assignments` | `manual_assignment=True`, `assigned_atom_ids` |
+| `id_pattern` | Step 1.5 `id_patterns`（新增） | `id_pattern` 列含命中规则 |
+| `pattern` | Step 2 `patterns`（距离） | `pattern` 列含匹配的 type 列表 |
+
+#### 4.10.6 警告汇总
+
+`cg-gen` 运行末尾打印去重计数后的警告（避免百万次刷屏），形如：
+
+```
+WARNINGS (id_pattern):
+  id_pattern: 中心 id=2 缺 id=70                                (×32 次)
+  id_pattern: 中心 id=3 缺 id=71                                (×32 次)
+  ...
+WARNINGS (r_cutoff):
+  中心原子 id=5 无匹配 pattern (r_cutoff=1.25)                   (×101 次)
+```
+
+按 `(类别, 消息)` 去重，括号内是相同消息的累计次数。`id_pattern_*` 类
+警告表示该中心原子已留给后续 patterns 阶段兜底，**不一定是错误**——只有
+当 `patterns` 阶段也兜底失败（`r_cutoff` 警告）时才说明真的漏配。
+
+#### 4.10.7 典型配置范例
+
+**A. 关闭所有新特性（最严格的旧版兼容）**：
+
+```json
+"coarse_graining": {
+  "patterns": [[1, 2, 2]],
+  "r_cutoff": null,
+  "unwrap_pbc": false,
+  "id_patterns": []
+}
+```
+
+**B. 启用 unwrap + r_cutoff，无 id_pattern（推荐基线）**：
+
+```json
+"coarse_graining": {
+  "patterns": [[1, 2, 2]],
+  "r_cutoff": 1.25,
+  "unwrap_pbc": true,
+  "unwrap_method": "chain",
+  "id_patterns": []
+}
+```
+
+**C. 全部启用（dump 的 id 编号规律一致时）**：
+
+```json
+"coarse_graining": {
+  "patterns": [[1, 2, 2]],
+  "r_cutoff": 1.25,
+  "unwrap_pbc": true,
+  "unwrap_method": "chain",
+  "id_patterns": [
+    {
+      "type_pattern": [1, 2, 2],
+      "id_offsets":   [0, 1, 2],
+      "cg_type":      1,
+      "description":  "CH2: C_id, C_id+1, C_id+2"
+    }
+  ]
+}
+```
+
+#### 4.10.8 边界情况
+
+| 情况 | 处理 |
+| :--- | :--- |
+| dump 无 `id` 列 | unwrap 按行号顺序；id_pattern 跳过并 warning |
+| `id_offsets[0] != 0` | 跳过此 id_pattern，warning |
+| `len(type_pattern) != len(id_offsets)` | 跳过此 id_pattern，warning |
+| id_pattern 候选 id 不存在 | warning，中心原子留给 patterns |
+| id_pattern 候选 type 不匹配 | warning，同上 |
+| id_pattern 候选已被占用 | warning，同上 |
+| `cg_assignments` 与 `id_pattern` 抢同一原子 | `cg_assignments` 先占用，`id_pattern` 报 `atom_used` |
+| `r_cutoff` 过小导致全部 pattern 不匹配 | bead 不生成，stdout 末尾汇总 |
+| unwrap 后坐标远超原盒子 | 正常（CG bead 也用 unwrap 坐标）；OVITO 可视化需注意 |
+| 旧 config 无新字段 | 用代码默认值，行为完全等同旧版 |
+
+#### 4.10.9 与 `cg-verify` 的协同
+
+`cg-verify` 已同步升级：
+
+- 读 `coarse_graining.{unwrap_pbc, r_cutoff, id_patterns}` 用于决定原子数据
+  是否走 unwrap 流程；
+- `verify_pbc_span` 与 `verify_conservation` 在 `unwrap_pbc=true` 时对原子
+  DataFrame 也跑一次 `_unwrap_chain_coords`，与 cg-gen 保持同一参考系；
+- `verify_conservation` 的位置比较改为最小镜像差
+  `|d - round(d/L)*L|`，无论 CG CSV 存的是 wrapped 还是 unwrap 后坐标，
+  都能在半个盒长内正确比较。
+
+预期：启用 unwrap 后，`verify_pbc_span` 报告的 FAIL 数应大幅下降（理想情况
+降到 0）。若仍出现 FAIL，说明 dump 的 id 编号不符合"链式"假设，应改用
+`--no-unwrap-pbc` 或改用 `id_patterns` 显式绑定。
+
 ---
 
 ## 5. 配置文件（`config.json`）
 
-`config.json` 是统一配置中心，包含 9 个顶层配置节：
+`config.json` 是统一配置中心，包含 12 个顶层配置节：
 
 | 配置节 | 说明 |
 | :--- | :--- |
@@ -433,8 +788,10 @@ return dx*dx + dy*dy + dz*dz
 | `deepmd` | DeepMD 数据格式参数（组数、类型列使用等） |
 | `fparam` | 温度单位、extract/const 的模拟名称与温度列表 |
 | `analysis_cg` | 采样数、最大文件数、输出目录等 |
-| `analysis_atomic` | 分析模式、最大帧数、SOAP/PCA/t-SNE/聚类/GNN 参数 |
+| `analysis_atomic` | 分析模式、最大帧数、SOAP/PCA/t-SNE/UMAP/聚类（含 `space` 字段）/GNN 参数 |
 | `plot_pt` | P–T 覆盖图的输出目录与最大帧数（`output_dir`, `max_frames`） |
+| `select_structures` | 结构筛选的输入 CSV、输出目录、聚类方法/参数（`input`, `output_dir`, `method`, `space`, `n_clusters`, `min_samples`, `include_noise`, `seed`） |
+| `verify_cg` | CG 校核的输出目录、检查项、容差（`output_dir`, `checks`, `force_tolerance`, `pe_tolerance`, `pbc_span_threshold`） |
 | `processing` | 并行开关、最大进程数、轨迹过滤规则 |
 | `output` | 各阶段保存开关（粒子/盒子/RAW/NPY 文件） |
 
