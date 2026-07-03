@@ -11,6 +11,7 @@
 5. **高维结构表征**：基于 SOAP 描述符 → PCA → t-SNE → 聚类（DBSCAN/KMeans）的完整降维与聚类流程，支持可选的 PyTorch GNN 图嵌入分析。
 6. **P–T 空间覆盖**：将每个原子级 dump 帧的 timestep 关联至 `log.lammps` 的 thermo 行，输出 P–T 散点图与 `pt_data.csv`，便于评估训练集的温度/压力覆盖度。
 7. **结构筛选**：消费 `analyze-atomic` 的 PCA/t-SNE 结果，在其投影空间上聚类，对每个类用 maximin（最远点采样）选 N 个最具多样性的构型，并把选中帧从源 dump 抽取成独立 LAMMPS dump 文件复制到指定目录，用于构造代表性训练子集。
+8. **模型验证**：对比 DeepMD 模型预测值与参考数据，生成 parity 对比图（力/能量）与误差分布直方图，输出 RMSE/MAE/R² 汇总指标。
 
 **设计优势**：
 - 统一入口（`cgkit.py`）替代原先 5 个独立脚本（约 5,200 行），保留原始算法 1:1 还原。
@@ -64,6 +65,8 @@ pip install numpy pandas tqdm
 | `cg-gen` | 无 |
 | `to-deepmd` | 无 |
 | `fparam extract / const` | 无 |
+| `cg-verify` | 无 |
+| `plot-test` | `matplotlib` |
 | `analyze-cg` | `matplotlib`, `scipy` |
 | `analyze-atomic` | `matplotlib`, `scipy`, `scikit-learn`；`networkx`（可选） |
 | `analyze-atomic`（SOAP 描述符） | 额外需要 `ase`, `dscribe` |
@@ -241,7 +244,8 @@ for pattern in patterns:                      # 按 config 中的顺序
 **力 / 势能规则**由 `force_energy_source` 控制（默认 `"average"`）：
 
 - `"average"`（默认）：
-  - 若 `average_forces=true`，`fx/fy/fz` = 组内所有原子分量的**算术平均**；
+  - 若 `average_forces=true`，`fx/fy/fz` = 组内所有原子分量的**质量加权平均**
+    （type 1 / C 质量 12，type 2 / H 质量 1）：∑(m_i · F_i) / ∑m_i；
   - 若 `average_potential_energy=true`，`c_pe` = 组内所有原子 `c_pe` 的平均。
 - `"center_only"`：直接取中心原子的 `fx/fy/fz/c_pe`，不做平均。
 
@@ -563,10 +567,50 @@ return dx*dx + dy*dy + dz*dz
   - `cg_assignments` 为空 → `verify_manual_fidelity` 返回空列表，不报错
   - 手动模式原子 ID 不在文件 → 打印 "NOT FOUND"，继续处理其它 ID
   - CSV 多 timestep → 按 timestep 分组，每组分别跑 4 项检查，原子文件用匹配 timestep 的 frame
+---
+
+### 4.10 `cgkit plot-test` — DeepMD 模型预测对比
+
+- **功能**：读取 DeepMD 模型预测输出（`dp test` 生成）与系统参考数据，生成 parity 对比图与误差分布直方图，输出 RMSE/MAE/R² 汇总指标。用于训练完成后验证 CG 势能的预测精度。
+
+- **对应模块**：`cglib/plot_test.py`（新增）
+
+- **生成的图表**：
+  - **Force parity plot**（`force_parity.png`）：Fx/Fy/Fz 三个分量分别绘制预测值 vs 参考值散点图，含 y=x 参考线及 RMSE/MAE/R² 标注。
+  - **Energy parity plot**（`energy_parity.png`）：能量预测值 vs 参考值散点图。
+  - **Force error distribution**（`force_error_dist.png`）：力误差（F_pred - F_ref）的直方图，标注均值、标准差、RMSE。
+  - **Energy error distribution**（`energy_error_dist.png`）：能量误差的直方图。
+
+- **数据格式**：自动支持 `.raw` 和 `.npy` 两种 DeepMD 输出格式；`--ref-dir` 支持自动检测（在 `--pred-dir` 的父目录/兄弟目录中查找）。
+
+- **配置节**：`plot_test.{pred_dir, ref_dir, output_dir, max_frames, skip_plots}`，`paths.{deepmd_output_base_dir, analysis_output_base_dir}`。
+
+- **常用 CLI 参数**：
+  - `--pred-dir PATH`：模型预测目录（含 `energy.raw/.npy`、`force.raw/.npy`）
+  - `--ref-dir PATH`：参考数据目录（可自动检测）
+  - `--output-dir PATH`：输出目录（写入图上和 `test_metrics.csv`）
+  - `--max-frames N`：限制对比帧数（均匀降采样）
+  - `--skip {force,energy}`：跳过指定类型的图表
+  - `--sim` / `--temp` / `--workers`：通用过滤/并行参数
+
+- **输出**（位于 `<output_dir>/`）：
+  - `force_parity.png`、`force_error_dist.png`
+  - `energy_parity.png`、`energy_error_dist.png`
+  - `test_metrics.csv`：列为 `quantity, rmse, mae, r2, n_frames`
+
+- **典型用法**：
+  ```bash
+  # 基本用法
+  cgkit plot-test --pred-dir test_output/ --ref-dir system_data/
+
+  # 限制帧数 + 只比较力
+  cgkit plot-test --pred-dir test_output/ --ref-dir system_data/ \
+      --max-frames 100 --skip energy
+  ```
 
 ---
 
-### 4.10 `cg-gen` 算法升级：PBC 链式 unwrap + r_cutoff + id_pattern
+### 4.11 `cg-gen` 算法升级：PBC 链式 unwrap + r_cutoff + id_pattern
 
 `cg-gen` 在原两阶段算法（`cg_assignments` → `patterns`）基础上，新增三项
 能力：周期性边界 unwrap 预处理、`r_cutoff` 距离截断、`id_patterns` 基于
@@ -791,6 +835,7 @@ WARNINGS (r_cutoff):
 | `analysis_atomic` | 分析模式、最大帧数、SOAP/PCA/t-SNE/UMAP/聚类（含 `space` 字段）/GNN 参数 |
 | `plot_pt` | P–T 覆盖图的输出目录与最大帧数（`output_dir`, `max_frames`） |
 | `select_structures` | 结构筛选的输入 CSV、输出目录、聚类方法/参数（`input`, `output_dir`, `method`, `space`, `n_clusters`, `min_samples`, `include_noise`, `seed`） |
+| `plot_test` | 模型预测对比的输入/输出目录、最大帧数、跳过项（`pred_dir`, `ref_dir`, `output_dir`, `max_frames`, `skip_plots`） |
 | `verify_cg` | CG 校核的输出目录、检查项、容差（`output_dir`, `checks`, `force_tolerance`, `pe_tolerance`, `pbc_span_threshold`） |
 | `processing` | 并行开关、最大进程数、轨迹过滤规则 |
 | `output` | 各阶段保存开关（粒子/盒子/RAW/NPY 文件） |

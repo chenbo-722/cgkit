@@ -485,11 +485,19 @@ def verify_conservation(cg_frame: pd.DataFrame,
         pos_err = max(_pbc_abs_diff(exp_pos[i], stored_pos[i], box_bounds, i)
                       for i in range(3))
 
-        # Force.
-        if avg_F and all(c in member for c in ('fx', 'fy', 'fz')):
-            exp_F = [float(member['fx'].mean()),
-                     float(member['fy'].mean()),
-                     float(member['fz'].mean())]
+        # Force — mass-weighted average (mirrors create_cg_particle).
+        if avg_F and all(c in member for c in ('fx', 'fy', 'fz', 'type')):
+            _type_mass = {1: 12.0, 2: 1.0}
+            masses = member['type'].map(_type_mass).astype(float)
+            total_mass = masses.sum()
+            if total_mass > 0:
+                exp_F = [float((member['fx'] * masses).sum() / total_mass),
+                         float((member['fy'] * masses).sum() / total_mass),
+                         float((member['fz'] * masses).sum() / total_mass)]
+            else:
+                exp_F = [float(member['fx'].mean()),
+                         float(member['fy'].mean()),
+                         float(member['fz'].mean())]
         else:
             exp_F = [float(center.get('fx', 0.0)),
                      float(center.get('fy', 0.0)),

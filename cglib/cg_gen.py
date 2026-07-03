@@ -202,9 +202,13 @@ def coarse_grain_trajectory(parser: LammpsDumpReader,
             avg_pe = center_row['c_pe'] if 'c_pe' in df.columns else None
         else:
             if cg_config.get("average_forces", True):
-                avg_fx = atom_rows['fx'].mean()
-                avg_fy = atom_rows['fy'].mean()
-                avg_fz = atom_rows['fz'].mean()
+                # Mass-weighted force averaging: type 1 (C)=12, type 2 (H)=1
+                _type_mass = {1: 12.0, 2: 1.0}
+                masses = atom_rows['type'].map(_type_mass)
+                total_mass = masses.sum()
+                avg_fx = (atom_rows['fx'] * masses).sum() / total_mass
+                avg_fy = (atom_rows['fy'] * masses).sum() / total_mass
+                avg_fz = (atom_rows['fz'] * masses).sum() / total_mass
             else:
                 avg_fx = avg_fy = avg_fz = 0
             avg_pe = None

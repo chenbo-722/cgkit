@@ -21,4 +21,5 @@ __all__ = [
     "pt_plot",
     "select_structures",
     "cg_verify",
+    "plot_test",
 ]
