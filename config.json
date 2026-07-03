@@ -127,6 +127,14 @@
     "seed": 42
   },
 
+  "plot_test": {
+    "pred_dir": null,
+    "ref_dir": null,
+    "output_dir": null,
+    "max_frames": null,
+    "skip_plots": []
+  },
+
   "verify_cg": {
     "output_dir": null,
     "checks": ["pbc", "conservation", "coverage", "manual"],

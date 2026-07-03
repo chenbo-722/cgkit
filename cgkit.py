@@ -24,7 +24,7 @@ from typing import Optional
 # Top-level: CLI + domain modules that need only numpy/pandas/tqdm.
 from cglib.cli import build_parser
 from cglib.config import load_config, merge_config_with_args, default_config_path
-from cglib import cg_gen, deepmd_conv, fparam, analyze_cg, pt_plot, select_structures, cg_verify
+from cglib import cg_gen, deepmd_conv, fparam, analyze_cg, pt_plot, select_structures, cg_verify, plot_test
 
 
 # =============================================================================
@@ -51,6 +51,7 @@ DISPATCH = {
     "plot-pt":           (pt_plot.run,           False),
     "select-structures": (select_structures.run, False),
     "cg-verify":         (cg_verify.run,         False),
+    "plot-test":         (plot_test.run,         False),
 }
 
 

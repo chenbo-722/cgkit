@@ -73,6 +73,7 @@ pip install numpy pandas tqdm
 | `fparam extract`     | _(none beyond required)_                                                 |
 | `fparam const`       | _(none beyond required)_                                                 |
 | `cg-verify`          | _(none beyond required)_                                                 |
+| `plot-test`          | `matplotlib`                                                             |
 | `analyze-cg`         | `matplotlib`, `scipy`                                                    |
 | `analyze-atomic`     | `matplotlib`, `scipy`, `scikit-learn`, `networkx` (optional)             |
 | `analyze-atomic` (SOAP)  | + `ase`, `dscribe`                                                   |
@@ -363,6 +364,43 @@ than N contribute all their members (with a `[small-cluster]` notice).
 
 ---
 
+### `cgkit plot-test`  *(new module)*
+
+Compares DeepMD model predictions (from ``dp test`` output) against reference
+data (from the system directory) and generates publication-quality comparison
+plots:
+
+- **Force parity plot** — per-component (Fx/Fy/Fz) scatter of predicted vs
+  reference forces with identity line and RMSE/MAE/R² annotations.
+- **Energy parity plot** — scatter of predicted vs reference energy.
+- **Force & energy error distributions** — histograms of prediction errors
+  with mean, std, and RMSE annotations.
+- **`test_metrics.csv`** — summary table of RMSE, MAE, R² for forces and energies.
+
+Input supports both ``.raw`` and ``.npy`` DeepMD formats and auto-detects the
+file type. The ``--ref-dir`` can be auto-detected from the prediction directory
+layout (looks for ``set.000`` sibling).
+
+**Config sections read:** `plot_test.*` (`pred_dir`, `ref_dir`, `output_dir`,
+`max_frames`, `skip_plots`), `paths.{deepmd_output_base_dir,
+analysis_output_base_dir}`.
+
+**CLI:**
+```
+--pred-dir PATH         directory with model predictions (energy.raw/.npy,
+                          force.raw/.npy from dp test)
+--ref-dir PATH          directory with reference data (auto-detect fallback)
+--output-dir PATH       where to write plots + test_metrics.csv
+--max-frames N          cap on compared frames (uniform downsample)
+--skip {force,energy}   skip specific plot types
+--sim/--temp/--workers  common
+```
+
+**Outputs** (under `<output_dir>/`):
+- `force_parity.png`, `force_error_dist.png`
+- `energy_parity.png`, `energy_error_dist.png`
+- `test_metrics.csv` — columns `quantity, rmse, mae, r2, n_frames`
+
 ### `cgkit cg-verify`  *(new module)*
 
 Cross-checks CG particle CSV files (`*_particles.csv`) against their source
@@ -471,6 +509,7 @@ The unified config has 8 top-level sections (plus `description`/`version`):
   "analysis_atomic":      { /* mode, max_frames, max_per_file, soap, pca, tsne, umap, clustering{space,...}, gnn_* */ },
   "plot_pt":              { /* output_dir, max_frames */ },
   "select_structures":    { /* input, output_dir, method, space, n_clusters, min_samples, include_noise, seed */ },
+  "plot_test":            { /* pred_dir, ref_dir, output_dir, max_frames, skip_plots */ },
   "verify_cg":            { /* output_dir, checks, force_tolerance, pe_tolerance, pbc_span_threshold */ },
   "processing":           { /* parallel, max_workers, trajectory_filter */ },
   "output":               { /* save_particles, save_box_vectors, save_raw_files, save_npy_files */ }
@@ -481,12 +520,14 @@ The unified config has 8 top-level sections (plus `description`/`version`):
 
 `cgkit` writes CLI overrides into the *right* config key per subcommand:
 
-| CLI flag             | cg-gen                   | to-deepmd                   | fparam extract              | fparam const                 | analyze-cg                 | analyze-atomic                | plot-pt                       | select-structures             |
-|----------------------|--------------------------|-----------------------------|-----------------------------|------------------------------|----------------------------|-------------------------------|-------------------------------|-------------------------------|
-| `--input FILE`       | _(n/a)_                  | _(n/a)_                     | _(n/a)_                     | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | _(n/a)_                       | `select_structures.input`     |
-| `--base-dir DIR`     | `paths.base_dir`         | `paths.cg_data_base_dir`    | _(n/a)_                     | `paths.deepmd_output_base_dir` | `paths.cg_data_base_dir`  | `paths.{cg,aa}_data_base_dir` | `paths.aa_data_base_dir`      | _(n/a)_                       |
-| `--output-dir DIR`   | `paths.cg_data_base_dir` | `paths.deepmd_output_base_dir` | `paths.deepmd_output_base_dir` | _(n/a)_                  | `analysis_cg.output_dir`   | `analysis_atomic.output_dir`  | `plot_pt.output_dir`          | `select_structures.output_dir`|
-| `--log-dir DIR`      | _(n/a)_                  | _(n/a)_                     | `paths.log_dir`             | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | `paths.log_dir`               | _(n/a)_                       |
+| CLI flag             | cg-gen                   | to-deepmd                   | fparam extract              | fparam const                 | analyze-cg                 | analyze-atomic                | plot-pt                       | select-structures             | plot-test                     |
+|----------------------|--------------------------|-----------------------------|-----------------------------|------------------------------|----------------------------|-------------------------------|-------------------------------|-------------------------------|-------------------------------|
+| `--input FILE`       | _(n/a)_                  | _(n/a)_                     | _(n/a)_                     | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | _(n/a)_                       | `select_structures.input`     | _(n/a)_                       |
+| `--base-dir DIR`     | `paths.base_dir`         | `paths.cg_data_base_dir`    | _(n/a)_                     | `paths.deepmd_output_base_dir` | `paths.cg_data_base_dir`  | `paths.{cg,aa}_data_base_dir` | `paths.aa_data_base_dir`      | _(n/a)_                       | _(n/a)_                       |
+| `--output-dir DIR`   | `paths.cg_data_base_dir` | `paths.deepmd_output_base_dir` | `paths.deepmd_output_base_dir` | _(n/a)_                  | `analysis_cg.output_dir`   | `analysis_atomic.output_dir`  | `plot_pt.output_dir`          | `select_structures.output_dir`| `plot_test.output_dir`        |
+| `--log-dir DIR`      | _(n/a)_                  | _(n/a)_                     | `paths.log_dir`             | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | `paths.log_dir`               | _(n/a)_                       | _(n/a)_                       |
+| `--pred-dir PATH`    | _(n/a)_                  | _(n/a)_                     | _(n/a)_                     | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | _(n/a)_                       | _(n/a)_                       | `plot_test.pred_dir`          |
+| `--ref-dir PATH`     | _(n/a)_                  | _(n/a)_                     | _(n/a)_                     | _(n/a)_                      | _(n/a)_                    | _(n/a)_                       | _(n/a)_                       | _(n/a)_                       | `plot_test.ref_dir`           |
 
 Mapping lives in `cglib/config.py::COMMAND_PATH_OVERRIDES`.
 
@@ -521,6 +562,7 @@ from cglib.analyze_cg   import CGDataAnalyzer
 from cglib.analyze_atomic import AtomicStructureAnalyzer, StructureDescriptor, GraphNeuralNetwork
 from cglib.cg_verify    import (verify_pbc_span, verify_conservation,
                                 verify_coverage, verify_manual_fidelity)
+from cglib.plot_test    import _read_raw, _read_npy, _compute_metrics
 ```
 
 **LAMMPS reader API (unified):**

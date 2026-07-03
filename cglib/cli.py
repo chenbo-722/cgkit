@@ -43,6 +43,7 @@ Examples:
   cgkit analyze-atomic --mode cg            # SOAP/PCA/t-SNE/UMAP on CG trajectories
   cgkit plot-pt                             # P-T coverage scatter from log.lammps
   cgkit select-structures --input pca_results.csv --n 3 --output-dir sel/
+  cgkit plot-test --pred-dir test_output/ --ref-dir system_data/
 """,
     )
     sub = parser.add_subparsers(dest='command', required=True, metavar='<command>')
@@ -212,6 +213,37 @@ Examples:
                             'cluster (default: skip noise).')
     p_sel.add_argument('--seed', type=int, default=None, metavar='N',
                        help='KMeans random seed (default: 42).')
+
+    # --- plot-test ----------------------------------------------------------
+    p_test = sub.add_parser(
+        'plot-test',
+        help='Compare DeepMD model predictions vs reference data',
+        description='Read model predictions (from dp test output) and reference '
+                    'data (from system directory) then generate parity plots, '
+                    'error distribution histograms, and metrics summary CSV. '
+                    'Useful for validating trained CG DeepMD potentials.',
+    )
+    add_common_args(p_test)
+    p_test.add_argument('--pred-dir', type=str, default=None, metavar='PATH',
+                        help='Directory with model predictions '
+                             '(energy.raw/.npy, force.raw/.npy from dp test). '
+                             'Fallback: plot_test.pred_dir → '
+                             'paths.deepmd_output_base_dir.')
+    p_test.add_argument('--ref-dir', type=str, default=None, metavar='PATH',
+                        help='Directory with reference data '
+                             '(energy.raw/.npy, force.raw/.npy from system). '
+                             'Fallback: plot_test.ref_dir → auto-detect.')
+    p_test.add_argument('--output-dir', type=str, default=None, metavar='PATH',
+                        help='Where to write plots + test_metrics.csv. '
+                             'Default: plot_test.output_dir → '
+                             'paths.analysis_output_base_dir.')
+    p_test.add_argument('--max-frames', type=int, default=None, metavar='N',
+                        help='Cap on dataset frames to compare '
+                             '(uniform downsample).')
+    p_test.add_argument('--skip', type=str, nargs='+', default=None,
+                        choices=['force', 'energy'],
+                        help='Skip specific plot types '
+                             '(e.g. --skip force energy).')
 
     # --- cg-verify ---------------------------------------------------------
     p_verify = sub.add_parser(
